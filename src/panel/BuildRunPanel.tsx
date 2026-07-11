@@ -89,10 +89,15 @@ export function BuildRunPanel({
   // dispatched by its `t` tag into the matching view.
   useEffect(() => {
     const handle = (raw: unknown) => {
-      // TEMP devtools diagnostic: log every run event so its shape and type are
-      // visible in the Studio inspector while the dev-tools panels are debugged.
-      console.log('[ide.run:event]', typeof raw, raw)
       const e = raw as { t?: string; [k: string]: unknown }
+      // TEMP devtools diagnostic: mirror every non-output run event into the
+      // visible Output panel so its type and shape are observable without an
+      // inspector while the console/bridge/page panels are debugged.
+      if (e.t !== 'output') {
+        const snippet =
+          typeof raw === 'string' ? raw : JSON.stringify(raw)
+        appendOutput('stdout', `[evt ${typeof raw}] ${String(snippet).slice(0, 240)}`)
+      }
       switch (e.t) {
         case 'status':
           if (typeof e.state === 'string') setRunState(e.state as RunState)
