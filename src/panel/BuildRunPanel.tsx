@@ -90,14 +90,6 @@ export function BuildRunPanel({
   useEffect(() => {
     const handle = (raw: unknown) => {
       const e = raw as { t?: string; [k: string]: unknown }
-      // TEMP devtools diagnostic: mirror every non-output run event into the
-      // visible Output panel so its type and shape are observable without an
-      // inspector while the console/bridge/page panels are debugged.
-      if (e.t !== 'output') {
-        const snippet =
-          typeof raw === 'string' ? raw : JSON.stringify(raw)
-        appendOutput('stdout', `[evt ${typeof raw}] ${String(snippet).slice(0, 240)}`)
-      }
       switch (e.t) {
         case 'status':
           if (typeof e.state === 'string') setRunState(e.state as RunState)
