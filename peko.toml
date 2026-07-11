@@ -1,0 +1,24 @@
+[project]
+name = "Peko Studio"
+bundle = "dev.pekodev.studio"
+version = "0.1.0"
+target_platforms = ["macos", "windows", "linux"]
+entry = "src/main.peko"
+
+[ui]
+framework = "static"
+scheme = "pekostudio"
+width = 1200
+height = 800
+
+[capabilities]
+uses = ["storage", "assets", "menu"]
+
+[dependencies]
+pekoui = "0.1.1"
+
+[icon]
+source = "icon/appicon.png"
+project = "icon/appicon.pekoicon"
+android_foreground = "icon/appicon-foreground.png"
+android_background = "icon/appicon-background.png"
