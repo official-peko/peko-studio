@@ -1,0 +1,22 @@
+# Dependencies
+node_modules
+
+# Build output
+assets
+dist
+build
+.peko
+
+# Peko lockfile is environment-specific for a path-dep scaffold
+peko.lock
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor and OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.local

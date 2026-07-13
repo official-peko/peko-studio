@@ -1,0 +1,3385 @@
+//! Peko Studio native host.
+//!
+//! Runs the pekoui webview shell and bridges the editor to the language server.
+//! The editor in the webview speaks LSP over a WebSocket; this host runs
+//! `peko lsp` as a child process and relays between the two:
+//!
+//!   editor  --ws text frame-->  host  --Content-Length stdio-->  peko lsp
+//!   editor  <--ws text frame--  host  <--Content-Length stdio--  peko lsp
+//!
+//! Each side has a single writer, so no two threads write the same pipe or
+//! socket at once. One editor connection is served at a time.
+
+import pekoui as ui;
+import pekoui::env;
+import std::process;
+import std::sockets;
+import std::threads;
+import std::fs;
+import std::io;
+import std::crypto;
+
+// The project the editor opens on launch. A real Peko project on disk, so the
+// language server resolves its dependencies (std, pekoui) from the project
+// manifest and reports diagnostics. The launcher opens a project by starting a
+// new window with PEKO_IDE_PROJECT set to its root; without it the last default
+// project opens.
+let WORKSPACE_ROOT: string = resolve_workspace_root();
+let ENTRY_FILE: string = project_entry(WORKSPACE_ROOT);
+
+/// Holds the running `peko run` dev-loop process so ide.run.stop can terminate
+/// it. A single-field shared object gives cross-handler mutable state.
+class RunHolder {
+	[mutates] child: process::Process?;
+	constructor() {
+		this.child = None;
+	}
+}
+
+let g_run: RunHolder = new RunHolder();
+
+/// Holds the running agent CLI (Claude Code) process so its input and lifecycle
+/// can be driven from the chat panel. The generation counter identifies the
+/// current session; the approval-watcher thread exits when it changes.
+class AgentHolder {
+	[mutates] child: process::Process?;
+	[mutates] generation: number;
+	constructor() {
+		this.child = None;
+		this.generation = 0;
+	}
+}
+
+let g_agent: AgentHolder = new AgentHolder();
+
+/// The set of files the editor has open, watched for external changes. The
+/// watcher thread reads the list under the lock; ide.watch replaces it.
+class WatchList {
+	[mutates] paths: Array<string>;
+	constructor() {
+		this.paths = new Array<string>();
+	}
+}
+
+let g_watch: threads::Mutex<WatchList> = new threads::Mutex<WatchList>(new WatchList());
+
+/// The directories the file tree has expanded, watched for added, removed, or
+/// renamed entries. Updated by ide.watch_dirs.
+let g_watch_dirs: threads::Mutex<WatchList> = new threads::Mutex<WatchList>(new WatchList());
+
+/// Caches the user's login-shell PATH. A Finder or Dock launch gives the app a
+/// minimal PATH that lacks node/npm and other user tools, so tools the build
+/// shells out to are not found. Computing the login PATH once and passing it to
+/// spawned peko processes restores them.
+class EnvCache {
+	[mutates] path: string;
+	constructor() {
+		this.path = "";
+	}
+}
+
+let g_env: EnvCache = new EnvCache();
+
+// Caches the signing verification JSON so opening the signing tab does not run
+// `peko keys verify` again on every render. The verify reads the OS keychain,
+// which prompts for authorization, so a cache keeps that to one prompt until a
+// key changes. Installing a key or setting a password invalidates it.
+class SigningCache {
+	[mutates] valid: bool;
+	[mutates] reports: string;
+	constructor() {
+		this.valid = false;
+		this.reports = "[]";
+	}
+}
+
+let g_signing: SigningCache = new SigningCache();
+
+// A shared one-shot flag guarding reader-thread startup.
+class Flag {
+	[public] value: bool;
+
+	constructor() {
+		this.value = false;
+	}
+}
+
+// The socket id of the live editor connection, shared with the reader thread so
+// language-server output always reaches the current editor even after a reload
+// reconnects. Zero means no editor is connected.
+class EditorFd {
+	[public] value: number;
+
+	constructor() {
+		this.value = 0;
+	}
+}
+
+/// Read one LSP message from the child's stdout and return its JSON body.
+/// Parses the Content-Length header block, then reads exactly that many bytes.
+/// None when the child's output ends.
+fn read_lsp_frame(lsp: process::Process) => string? {
+	let length: number = 0;
+	let prefix: string = "Content-Length:";
+	let reading_headers: bool = true;
+	while reading_headers {
+		let header: string? = lsp.read_line();
+		if !header.is_value() {
+			return None;
+		}
+		let line: string = header.unwrap();
+		if line.size() == 0 {
+			reading_headers = false;
+		} else if line.size() >= 15 {
+			if line.substring(0, 15) == prefix {
+				length = line.substring(15, line.size()).to_number();
+			}
+		}
+	}
+
+	let body: StringBuilder = new StringBuilder();
+	let remaining: number = length;
+	while remaining > 0 {
+		let chunk: string? = lsp.read(remaining);
+		if !chunk.is_value() {
+			return None;
+		}
+		let piece: string = chunk.unwrap();
+		body.append(piece);
+		remaining = remaining - piece.size();
+	}
+	return body.to_string();
+}
+
+/// Frame a JSON-RPC message with a Content-Length header and write it to the
+/// child's stdin.
+fn write_lsp_frame(lsp: process::Process, message: string) {
+	let header: string = `Content-Length: ${message.size()}\r\n\r\n`;
+	lsp.write(header);
+	lsp.write(message);
+}
+
+/// Spawn `peko lsp`. Runs before any window or webview exists so the fork
+/// happens in a clean process state, not after the GUI toolkit is initialized.
+/// None when the server binary cannot be found.
+fn spawn_lsp() => process::Process? {
+	let lsp_args: Array<string> = new Array<string>();
+	lsp_args.push("lsp");
+
+	// A terminal or dev-loop launch has peko on PATH already.
+	let on_path: process::Process? = process::spawn(peko_exe(), lsp_args);
+	if on_path.is_value() {
+		return on_path;
+	}
+
+	// Otherwise launch the installed binary by absolute path. It defaults
+	// PEKO_ROOT_PATH to this root, so the server finds the standard library.
+	let root: string = peko_root();
+	if root.size() == 0 {
+		return None;
+	}
+	let bin: string = `${root}/Compiler/bin/peko/${peko_exe()}`;
+
+	// A Windows GUI app inherits the system PATH, so run the binary directly.
+	if env::os() == "windows" {
+		return process::spawn(bin, lsp_args);
+	}
+	// A macOS Finder or Dock launch has a minimal PATH; route through env to set
+	// PEKO_ROOT_PATH and the enriched PATH the server may need.
+	let env_args: Array<string> = new Array<string>();
+	env_args.push(`PATH=${resolve_path()}`);
+	env_args.push(`PEKO_ROOT_PATH=${root}`);
+	env_args.push(bin);
+	env_args.push("lsp");
+	return process::spawn("/usr/bin/env", env_args);
+}
+
+/// Run `<bin>/node -v` and score the result as major*1000 + minor, or -1 when
+/// the binary is absent or does not report a version.
+fn node_version_score(bin: string) => number {
+	let node_path: string = `${bin}/node`;
+	if !fs::exists(node_path) {
+		return -1;
+	}
+	let version_args: Array<string> = new Array<string>();
+	version_args.push("-v");
+	let spawned: process::Process? = process::spawn(node_path, version_args);
+	if !spawned.is_value() {
+		return -1;
+	}
+	let child: process::Process = spawned.unwrap();
+	let out: string = "";
+	let line: string? = child.read_line();
+	while line.is_value() {
+		out = `${out}${line.unwrap()}`;
+		line = child.read_line();
+	}
+	child.wait();
+	if out.size() < 2 {
+		return -1;
+	}
+	// out is like "v24.15.0"; drop the leading v and read major.minor.
+	let body: string = out.substring(1, out.size());
+	let first_dot: number = body.index_of(".");
+	if first_dot < 0 {
+		return -1;
+	}
+	let major_opt: number? = body.substring(0, first_dot).to_number();
+	if !major_opt.is_value() {
+		return -1;
+	}
+	let rest: string = body.substring(first_dot + 1, body.size());
+	let second_dot: number = rest.index_of(".");
+	let minor_text: string = rest;
+	if second_dot >= 0 {
+		minor_text = rest.substring(0, second_dot);
+	}
+	let minor: number = 0;
+	let minor_opt: number? = minor_text.to_number();
+	if minor_opt.is_value() {
+		minor = minor_opt.unwrap();
+	}
+	return major_opt.unwrap() * 1000 + minor;
+}
+
+/// Whether a node version score satisfies modern build tools (Vite): 20.19+ or
+/// 22.12+. The odd, end-of-life 21.x line is excluded.
+fn node_is_compatible(score: number) => bool {
+	if score < 0 {
+		return false;
+	}
+	if score >= 20019 && score < 21000 {
+		return true;
+	}
+	return score >= 22012;
+}
+
+/// The bin directory of the newest compatible node found among the user's nvm
+/// versions and Homebrew LTS kegs, or empty when none is compatible. Lets a
+/// build succeed even when the default `node` is an incompatible release.
+fn preferred_node_bin() => string {
+	let candidates: Array<string> = new Array<string>();
+	let home: string = env::get("HOME");
+	if home.size() > 0 {
+		let nvm_dir: string = `${home}/.nvm/versions/node`;
+		if fs::is_directory(nvm_dir) {
+			let versions: Array<string> = fs::list_dir(nvm_dir);
+			let v: number = 0;
+			while v < versions.size() {
+				candidates.push(`${nvm_dir}/${versions[v]}/bin`);
+				v = v + 1;
+			}
+		}
+	}
+	candidates.push("/opt/homebrew/opt/node@24/bin");
+	candidates.push("/opt/homebrew/opt/node@22/bin");
+	candidates.push("/opt/homebrew/opt/node@20/bin");
+	candidates.push("/usr/local/opt/node@24/bin");
+	candidates.push("/usr/local/opt/node@22/bin");
+	candidates.push("/usr/local/opt/node@20/bin");
+
+	let best_bin: string = "";
+	let best_score: number = -1;
+	let i: number = 0;
+	while i < candidates.size() {
+		let score: number = node_version_score(candidates[i]);
+		if node_is_compatible(score) && score > best_score {
+			best_score = score;
+			best_bin = candidates[i];
+		}
+		i = i + 1;
+	}
+	return best_bin;
+}
+
+/// The user's login-shell PATH, computed once and cached. A Finder/Dock launch
+/// runs with a minimal PATH, so a build's npm/node are missing; the login shell
+/// reports the real PATH. A compatible node's bin directory is prepended when
+/// the default node is an incompatible version. Windows GUI apps already
+/// inherit the system PATH, so it is used as-is there.
+fn resolve_path() => string {
+	if g_env.path.size() > 0 {
+		return g_env.path;
+	}
+	if env::os() == "windows" {
+		g_env.path = env::get("PATH");
+		return g_env.path;
+	}
+	let shell: string = env::get("SHELL");
+	if shell.size() == 0 {
+		shell = "/bin/zsh";
+	}
+	// Interactive + login so both profile and rc files run (nvm and similar add
+	// their PATH in the rc file). A marker isolates the PATH from any banner a
+	// dotfile prints on startup.
+	let shell_args: Array<string> = new Array<string>();
+	shell_args.push("-ilc");
+	shell_args.push("printf 'PEKOPATH::%s' \"$PATH\"");
+	let discovered: string = "";
+	let spawned: process::Process? = process::spawn(shell, shell_args);
+	if spawned.is_value() {
+		let child: process::Process = spawned.unwrap();
+		let line: string? = child.read_line();
+		while line.is_value() {
+			let text: string = line.unwrap();
+			let marker: number = text.index_of("PEKOPATH::");
+			if marker >= 0 {
+				discovered = text.substring(marker + 10, text.size());
+			}
+			line = child.read_line();
+		}
+		child.wait();
+	}
+	if discovered.size() == 0 {
+		discovered = env::get("PATH");
+	}
+	let base: string = `/opt/homebrew/bin:/usr/local/bin:${discovered}`;
+	// Put a compatible node ahead of an incompatible default (e.g. an EOL 21.x).
+	let node_bin: string = preferred_node_bin();
+	if node_bin.size() > 0 {
+		g_env.path = `${node_bin}:${base}`;
+	} else {
+		g_env.path = base;
+	}
+	return g_env.path;
+}
+
+/// Spawn `peko <args>` in `dir`, with the same PATH-then-HOME fallback the
+/// language server launch uses so a Finder/Dock launch still finds the binary.
+/// None when the peko binary cannot be located.
+fn spawn_peko_in(args: Array<string>, dir: string) => process::Process? {
+	let on_path: process::Process? = process::spawn_in(peko_exe(), args, dir);
+	if on_path.is_value() {
+		return on_path;
+	}
+	let root: string = peko_root();
+	if root.size() == 0 {
+		return None;
+	}
+	let bin: string = `${root}/Compiler/bin/peko/${peko_exe()}`;
+
+	// A Windows GUI app inherits the system PATH, so run the binary directly. It
+	// defaults PEKO_ROOT_PATH to the install root.
+	if env::os() == "windows" {
+		return process::spawn_in(bin, args, dir);
+	}
+	// A macOS Finder or Dock launch has a minimal PATH; route through env to add
+	// the enriched PATH (node and similar) and PEKO_ROOT_PATH.
+	let env_args: Array<string> = new Array<string>();
+	env_args.push(`PATH=${resolve_path()}`);
+	env_args.push(`PEKO_ROOT_PATH=${root}`);
+	env_args.push(bin);
+	let index: number = 0;
+	while index < args.size() {
+		env_args.push(args[index]);
+		index = index + 1;
+	}
+	return process::spawn_in("/usr/bin/env", env_args, dir);
+}
+
+/// Run `peko <args>` in the workspace and return its stdout (lines joined). Used
+/// for the short, machine-readable `peko keys` commands.
+fn run_peko_capture(args: Array<string>) => string {
+	let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+	if !spawned.is_value() {
+		return "";
+	}
+	let child: process::Process = spawned.unwrap();
+	let out: string = "";
+	let line: string? = child.read_line();
+	while line.is_value() {
+		out = `${out}${line.unwrap()}`;
+		line = child.read_line();
+	}
+	child.wait();
+	return out;
+}
+
+/// Run `peko <args>` in the workspace to completion, and return a JSON reply
+/// {ok, output} with the exit status and the combined stdout and stderr. Used
+/// for the package manager's add and remove commands.
+fn run_peko_result(args: Array<string>) => string {
+	let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+	if !spawned.is_value() {
+		let message: string = new json::JsonString("could not run peko").to_string();
+		return `{"ok":false,"output":${message}}`;
+	}
+	let child: process::Process = spawned.unwrap();
+	let out: string = "";
+	let line: string? = child.read_line();
+	while line.is_value() {
+		out = `${out}${line.unwrap()}\n`;
+		line = child.read_line();
+	}
+	let errline: string? = child.read_error_line();
+	while errline.is_value() {
+		out = `${out}${errline.unwrap()}\n`;
+		errline = child.read_error_line();
+	}
+	let code: number = child.wait();
+	let ok: string = "false";
+	if code == 0 {
+		ok = "true";
+	}
+	let out_json: string = new json::JsonString(out).to_string();
+	return `{"ok":${ok},"output":${out_json}}`;
+}
+
+/// Run a command in HOME and return its joined stdout, empty on a launch
+/// failure. Used for the short queries the CLI bootstrap needs.
+fn command_capture(bin: string, args: Array<string>) => string {
+	let dir: string = env::get("HOME");
+	if dir.size() == 0 {
+		dir = ".";
+	}
+	let spawned: process::Process? = process::spawn_in(bin, args, dir);
+	if !spawned.is_value() {
+		return "";
+	}
+	let child: process::Process = spawned.unwrap();
+	let out: string = "";
+	let line: string? = child.read_line();
+	while line.is_value() {
+		out = `${out}${line.unwrap()}`;
+		line = child.read_line();
+	}
+	child.wait();
+	return out;
+}
+
+/// Run a command to completion in HOME and return its exit code, draining its
+/// output. -1 when the command cannot be launched.
+fn command_code(bin: string, args: Array<string>) => number {
+	let dir: string = env::get("HOME");
+	if dir.size() == 0 {
+		dir = ".";
+	}
+	let spawned: process::Process? = process::spawn_in(bin, args, dir);
+	if !spawned.is_value() {
+		return -1;
+	}
+	let child: process::Process = spawned.unwrap();
+	let line: string? = child.read_line();
+	while line.is_value() {
+		line = child.read_line();
+	}
+	let errline: string? = child.read_error_line();
+	while errline.is_value() {
+		errline = child.read_error_line();
+	}
+	return child.wait();
+}
+
+/// The GitHub release target triple for this host, empty when unsupported.
+fn host_triple() => string {
+	let os: string = env::os();
+	if os == "windows" {
+		return "x86_64-pc-windows-msvc";
+	}
+	let uname_args: Array<string> = new Array<string>();
+	uname_args.push("-m");
+	let machine: string = command_capture("uname", uname_args);
+	let cpu: string = "";
+	if machine == "arm64" || machine == "aarch64" {
+		cpu = "aarch64";
+	} else if machine == "x86_64" {
+		cpu = "x86_64";
+	}
+	if cpu.size() == 0 {
+		return "";
+	}
+	if os == "macos" {
+		return `${cpu}-apple-darwin`;
+	}
+	if os == "linux" {
+		return `${cpu}-unknown-linux-gnu`;
+	}
+	return "";
+}
+
+/// The Peko install root: PEKO_ROOT_PATH, or HOME/.Peko (USERPROFILE/.Peko on
+/// Windows, where HOME is usually unset), empty when none is known.
+fn peko_root() => string {
+	let root: string = env::get("PEKO_ROOT_PATH");
+	if root.size() > 0 {
+		return root;
+	}
+	let home: string = env::get("HOME");
+	if home.size() == 0 {
+		home = env::get("USERPROFILE");
+	}
+	if home.size() == 0 {
+		return "";
+	}
+	return `${home}/.Peko`;
+}
+
+/// The user's home directory: HOME, or USERPROFILE on Windows where HOME is
+/// usually unset. Empty when neither is set.
+fn home_dir() => string {
+	let home: string = env::get("HOME");
+	if home.size() == 0 {
+		home = env::get("USERPROFILE");
+	}
+	return home;
+}
+
+/// The peko binary file name for this host.
+fn peko_exe() => string {
+	if env::os() == "windows" {
+		return "peko.exe";
+	}
+	return "peko";
+}
+
+/// The peko binary to run, or empty when peko is not installed. Prefers the
+/// installed binary, then a peko on PATH. Checking the file directly is reliable
+/// where spawning is not: launching `/usr/bin/env <missing>` still succeeds and
+/// only fails at runtime, so it cannot report absence.
+fn resolve_peko() => string {
+	let bin_name: string = "peko";
+	if env::os() == "windows" {
+		bin_name = "peko.exe";
+	}
+	let root: string = peko_root();
+	if root.size() > 0 {
+		let installed: string = `${root}/Compiler/bin/peko/${bin_name}`;
+		if fs::exists(installed) {
+			return installed;
+		}
+	}
+	let ver_args: Array<string> = new Array<string>();
+	ver_args.push("version");
+	if command_code("peko", ver_args) == 0 {
+		return "peko";
+	}
+	return "";
+}
+
+/// Download the peko CLI from the latest peko-tools release into
+/// HOME/.Peko/Compiler/bin/peko when it is absent, so a machine that has never
+/// had peko can still run setup. curl fetches the release, tar unpacks it, and
+/// the binary is made executable. Returns the binary path, empty on failure.
+fn bootstrap_peko() => string {
+	let triple: string = host_triple();
+	if triple.size() == 0 {
+		return "";
+	}
+	let os: string = env::os();
+
+	// The latest release tag, read from the redirect the releases/latest URL
+	// resolves to (.../releases/tag/<tag>). This avoids parsing JSON.
+	let null_path: string = "/dev/null";
+	if os == "windows" {
+		null_path = "NUL";
+	}
+	let redirect_args: Array<string> = new Array<string>();
+	redirect_args.push("-sIL");
+	redirect_args.push("-o");
+	redirect_args.push(null_path);
+	redirect_args.push("-w");
+	redirect_args.push("%{url_effective}");
+	redirect_args.push("https://github.com/official-peko/peko-tools/releases/latest");
+	let effective: string = command_capture("curl", redirect_args);
+	let marker: string = "/tag/";
+	let marker_index: number = effective.index_of(marker);
+	if marker_index < 0 {
+		return "";
+	}
+	let tag: string = effective.substring(marker_index + 5, effective.size());
+	if tag.size() == 0 {
+		return "";
+	}
+	let version: string = tag;
+	if version.starts_with("v") {
+		version = version.substring(1, version.size());
+	}
+
+	let ext: string = ".tar.xz";
+	if os == "windows" {
+		ext = ".zip";
+	}
+	let asset: string = `peko-${version}-${triple}${ext}`;
+	let url: string = `https://github.com/official-peko/peko-tools/releases/download/${tag}/${asset}`;
+
+	let root: string = env::get("PEKO_ROOT_PATH");
+	if root.size() == 0 {
+		let home: string = env::get("HOME");
+		if home.size() == 0 {
+			home = env::get("USERPROFILE");
+		}
+		if home.size() == 0 {
+			return "";
+		}
+		root = `${home}/.Peko`;
+	}
+	// A staging directory outside Compiler/. Setup atomically replaces Compiler/
+	// while running, so a peko launched from inside it would be clobbered part
+	// way through. From here it survives; setup copies it into place at the end.
+	let bin_dir: string = `${root}/tmp`;
+	let bin_name: string = "peko";
+	if os == "windows" {
+		bin_name = "peko.exe";
+	}
+	let bin_path: string = `${bin_dir}/${bin_name}`;
+	let archive: string = `${bin_dir}/.peko-download${ext}`;
+
+	// Ensure the staging directory exists (fs::make_dir is not recursive, so the
+	// root is created first). Then delete any prior staged binary, its archive,
+	// and the retired peko-ls, so a stale file from an old install or a restored
+	// backup can never be used in place of the fresh download. Portable file ops
+	// are used here instead of shelling to mkdir/rm, which differ on Windows.
+	fs::make_dir(root);
+	fs::make_dir(bin_dir);
+	fs::remove(bin_path);
+	fs::remove(archive);
+	fs::remove(`${bin_dir}/peko-ls`);
+
+	let dl_args: Array<string> = new Array<string>();
+	dl_args.push("-fSL");
+	dl_args.push("-o");
+	dl_args.push(archive);
+	dl_args.push(url);
+	if command_code("curl", dl_args) != 0 {
+		return "";
+	}
+
+	// tar auto-detects the format, so this unpacks both .tar.xz and .zip. curl
+	// and tar both ship with Windows 10 and later as well as macOS and Linux.
+	let tar_args: Array<string> = new Array<string>();
+	tar_args.push("-xf");
+	tar_args.push(archive);
+	tar_args.push("-C");
+	tar_args.push(bin_dir);
+	if command_code("tar", tar_args) != 0 {
+		return "";
+	}
+
+	fs::remove(archive);
+
+	if os != "windows" {
+		let chmod_args: Array<string> = new Array<string>();
+		chmod_args.push("+x");
+		chmod_args.push(bin_path);
+		command_code("chmod", chmod_args);
+	}
+
+	if !fs::exists(bin_path) {
+		return "";
+	}
+	return bin_path;
+}
+
+/// Join a directory listing into a single string, so a change to the set of
+/// entries can be detected by comparison.
+fn join_listing(entries: Array<string>) => string {
+	let joined: string = "";
+	let index: number = 0;
+	let one: number = 1;
+	while index < entries.size() {
+		joined = `${joined}${entries[index]}\n`;
+		index = index + one;
+	}
+	return joined;
+}
+
+/// Start the file watcher: a background thread that polls each open file for
+/// external changes and emits ide.fs.change {path} when one differs from the
+/// last seen content. The editor reloads the affected tab. The watched set is
+/// updated by the ide.watch handler.
+fn start_file_watcher(application: ui::app::App) {
+	threads::new_thread(
+		closure[application]() => void {
+			let snapshots: Map<string, string> = new Map<string, string>();
+			let dir_snapshots: Map<string, string> = new Map<string, string>();
+			let running: bool = true;
+			let one: number = 1;
+			while running {
+				threads::sleep_ms(700);
+
+				// Open files: emit ide.fs.change when the content differs.
+				let holder: WatchList = g_watch.lock();
+				let paths: Array<string> = holder.paths;
+				g_watch.release();
+				let index: number = 0;
+				while index < paths.size() {
+					let path: string = paths[index];
+					let content: string? = fs::read_file(path);
+					let current: string = "";
+					if content.is_value() {
+						current = content.unwrap();
+					}
+					let previous: string? = snapshots.get(path);
+					if previous.is_value() {
+						if previous.unwrap() != current {
+							snapshots.set(path, current);
+							let path_json: string = new json::JsonString(path).to_string();
+							application.emit("ide.fs.change", `{"path":${path_json}}`);
+						}
+					} else {
+						snapshots.set(path, current);
+					}
+					index = index + one;
+				}
+
+				// Expanded directories: emit ide.fs.tree when the listing differs.
+				let dir_holder: WatchList = g_watch_dirs.lock();
+				let dirs: Array<string> = dir_holder.paths;
+				g_watch_dirs.release();
+				let dir_index: number = 0;
+				while dir_index < dirs.size() {
+					let dir_path: string = dirs[dir_index];
+					let listing: string = join_listing(fs::list_dir(dir_path));
+					let prev_listing: string? = dir_snapshots.get(dir_path);
+					if prev_listing.is_value() {
+						if prev_listing.unwrap() != listing {
+							dir_snapshots.set(dir_path, listing);
+							let dir_json: string = new json::JsonString(dir_path).to_string();
+							application.emit("ide.fs.tree", `{"path":${dir_json}}`);
+						}
+					} else {
+						dir_snapshots.set(dir_path, listing);
+					}
+					dir_index = dir_index + one;
+				}
+			}
+		},
+	);
+}
+
+/// Stream a child's stdout and stderr to the webview as `event_name` output
+/// events, then emit a final idle status with the exit code. Runs the wait on a
+/// new thread so the bridge call that started the child returns immediately and
+/// does not block dispatch for the life of a build.
+fn stream_process(
+	application: ui::app::App,
+	child: process::Process,
+	event_name: string,
+	label: string,
+) {
+	threads::new_thread(
+		closure[application, child, event_name, label]() => void {
+			child.on_output(
+				closure[application, event_name](line: string) => void {
+					let text_json: string = new json::JsonString(line).to_string();
+					application.emit(event_name, `{"t":"output","stream":"stdout","text":${text_json}}`);
+				},
+			);
+			child.on_error(
+				closure[application, event_name](line: string) => void {
+					let text_json: string = new json::JsonString(line).to_string();
+					application.emit(event_name, `{"t":"output","stream":"stderr","text":${text_json}}`);
+				},
+			);
+			let code: number = child.wait();
+			let summary: string = new json::JsonString(`${label} exited with code ${code}`).to_string();
+			application.emit(event_name, `{"t":"output","stream":"stdout","text":${summary}}`);
+			application.emit(event_name, `{"t":"status","state":"idle"}`);
+		},
+	);
+}
+
+/// Stream a `peko run --ide` child to the panel. Its stdout carries dev events
+/// as newline-delimited JSON, so each stdout line is forwarded unchanged as an
+/// ide.run event. Its stderr carries human logs, wrapped as output events. On
+/// exit the run reports idle. Runs the wait on a new thread so the start call
+/// returns at once.
+fn stream_run(application: ui::app::App, child: process::Process) {
+	threads::new_thread(
+		closure[application, child]() => void {
+			child.on_output(
+				closure[application](line: string) => void {
+					if line.size() == 0 {
+						return;
+					}
+					// A dev event is a JSON object, forwarded as-is. Any other stdout
+					// line is human log output (reporter status, dev-server banner),
+					// wrapped as an output event. Stdout lines are written whole, so a
+					// leading brace reliably tells the two apart.
+					if line.starts_with("{") {
+						application.emit("ide.run:event", line);
+					} else {
+						let text_json: string = new json::JsonString(line).to_string();
+						application.emit("ide.run:event", `{"t":"output","stream":"stdout","text":${text_json}}`);
+					}
+				},
+			);
+			child.on_error(
+				closure[application](line: string) => void {
+					let text_json: string = new json::JsonString(line).to_string();
+					application.emit("ide.run:event", `{"t":"output","stream":"stderr","text":${text_json}}`);
+				},
+			);
+			child.wait();
+			application.emit("ide.run:event", `{"t":"status","state":"idle"}`);
+		},
+	);
+}
+
+/// Stream a `peko setup --json` child to the first-run setup screen. Each stdout
+/// line is one newline-delimited JSON progress event, forwarded unchanged as an
+/// ide.setup:event. Human stderr lines are wrapped as stderr events. On exit the
+/// final code is reported as ide.setup:done. The wait runs on a new thread so the
+/// start call returns at once.
+fn run_setup_flow(application: ui::app::App, args: Array<string>, dir: string) {
+	threads::new_thread(
+		closure[application, args, dir]() => void {
+			// The setup screen only shows when the toolchain is unhealthy, so a
+			// peko already on disk cannot be trusted. Always fetch the release CLI
+			// first; fall back to an installed peko only if the download fails.
+			// Running on this background thread keeps the bridge free so progress
+			// streams live instead of blocking behind the download.
+			application.emit(
+				"ide.setup:event",
+				`{"type":"status","message":"downloading the Peko CLI"}`,
+			);
+			let peko_path: string = bootstrap_peko();
+			if peko_path.size() == 0 {
+				peko_path = resolve_peko();
+				if peko_path.size() == 0 {
+					application.emit(
+						"ide.setup:event",
+						`{"type":"error","message":"could not download the Peko CLI"}`,
+					);
+					application.emit("ide.setup:done", `{"code":1}`);
+					return;
+				}
+			}
+			application.emit(
+				"ide.setup:event",
+				`{"type":"status","message":"running the installer"}`,
+			);
+			let spawned: process::Process? = process::spawn_in(peko_path, args, dir);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.setup:event",
+					`{"type":"error","message":"could not launch peko setup"}`,
+				);
+				application.emit("ide.setup:done", `{"code":1}`);
+				return;
+			}
+			let child: process::Process = spawned.unwrap();
+			child.on_output(
+				closure[application](line: string) => void {
+					if line.size() == 0 {
+						return;
+					}
+					// A setup event is a JSON object, forwarded as-is. Any other
+					// stdout line is human log output, wrapped as an info event.
+					if line.starts_with("{") {
+						application.emit("ide.setup:event", line);
+					} else {
+						let text_json: string = new json::JsonString(line).to_string();
+						application.emit("ide.setup:event", `{"type":"info","message":${text_json}}`);
+					}
+				},
+			);
+			child.on_error(
+				closure[application](line: string) => void {
+					let text_json: string = new json::JsonString(line).to_string();
+					application.emit("ide.setup:event", `{"type":"stderr","message":${text_json}}`);
+				},
+			);
+			let code: number = child.wait();
+			application.emit("ide.setup:done", `{"code":${code}}`);
+		},
+	);
+}
+
+/// Ask the running dev loop to tear down: send a stop command and close its
+/// input so the loop kills the app window and dev server on its way out.
+fn stop_run() {
+	if g_run.child.is_value() {
+		let child: process::Process = g_run.child.unwrap();
+		child.write_line(`{"t":"stop"}`);
+		child.close_input();
+		g_run.child = None;
+	}
+}
+
+/// A filesystem-safe key from a path (used to name per-workspace state files).
+fn sanitize_key(path: string) => string {
+	let out: string = "";
+	let index: number = 0;
+	while index < path.size() {
+		let ch: string = path.substring(index, index + 1);
+		if ch == "/" || ch == " " || ch == "." || ch == ":" {
+			out = `${out}-`;
+		} else {
+			out = `${out}${ch}`;
+		}
+		index = index + 1;
+	}
+	return out;
+}
+
+/// The per-workspace chat-threads store. Kept next to the other Peko Studio
+/// state under HOME, keyed by the workspace path.
+fn threads_file() => string {
+	let home: string = env::get("HOME");
+	fs::make_dir(`${home}/.peko-studio`);
+	let dir: string = `${home}/.peko-studio/threads`;
+	fs::make_dir(dir);
+	return `${dir}/${sanitize_key(WORKSPACE_ROOT)}.json`;
+}
+
+/// The agent CLI command. The chat panel is a thin wrapper over this tool.
+fn agent_command() => string {
+	return "claude";
+}
+
+/// The directory holding Peko Studio state under HOME.
+fn studio_dir() => string {
+	let home: string = env::get("HOME");
+	let dir: string = `${home}/.peko-studio`;
+	fs::make_dir(dir);
+	return dir;
+}
+
+/// The MCP permission server script, its config, and the request/response
+/// exchange directory. Claude Code consults the server for every gated action
+/// when the chat panel runs in an interactive permission mode.
+fn mcp_script_file() => string {
+	return `${studio_dir()}/mcp-approval.mjs`;
+}
+
+fn mcp_config_file() => string {
+	return `${studio_dir()}/mcp-config.json`;
+}
+
+fn approvals_dir() => string {
+	return `${studio_dir()}/approvals`;
+}
+
+/// The IDE-owned Claude Code plugin directory. It holds the Peko development
+/// skill and is passed to the agent CLI as a session plugin dir, so the skill is
+/// available without touching the user's project or global config.
+fn agent_plugin_dir() => string {
+	return `${studio_dir()}/agent-plugin`;
+}
+
+/// The cached platform identity. The chip reads this on startup so the common
+/// case shows the signed-in user without a keychain read. The keychain-backed
+/// session is only touched on an explicit login or refresh.
+fn account_cache_file() => string {
+	return `${studio_dir()}/account.json`;
+}
+
+/// Strip leading and trailing ASCII spaces from a string.
+fn strip_spaces(text: string) => string {
+	let start: number = 0;
+	while start < text.size() && text.substring(start, start + 1) == " " {
+		start = start + 1;
+	}
+	let end: number = text.size();
+	while end > start && text.substring(end - 1, end) == " " {
+		end = end - 1;
+	}
+	return text.substring(start, end);
+}
+
+/// The value after the first colon in a "label: value" line.
+fn value_after_colon(text: string) => string {
+	let colon: number = text.index_of(":");
+	if colon < 0 {
+		return "";
+	}
+	return strip_spaces(text.substring(colon + 1, text.size()));
+}
+
+/// Run `peko whoami --json`, capture the identity, cache it, and return it. The
+/// clean object form is used when present; otherwise the legacy per-line reporter
+/// output is parsed so an older installed CLI still works. A signed-out or
+/// unreachable state returns an unauthenticated object. This reads the
+/// keychain-backed session, so it runs only on an explicit login or refresh.
+fn refresh_account_identity() => string {
+	let identity: string = `{"authenticated":false}`;
+	let args: Array<string> = new Array<string>();
+	args.push("whoami");
+	args.push("--json");
+	let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+	if !spawned.is_value() {
+		return identity;
+	}
+	let child: process::Process = spawned.unwrap();
+	let uid: string = "";
+	let email: string = "";
+	let name: string = "";
+	let role: string = "";
+	let tier: string = "";
+	let clean: string = "";
+	let reading: bool = true;
+	while reading {
+		let line: string? = child.read_line();
+		if !line.is_value() {
+			reading = false;
+		} else {
+			let text: string = line.unwrap();
+			if text.contains(`"authenticated"`) {
+				clean = text;
+			} else {
+				// Legacy reporter events: {"message":"name:  X","type":"info"}.
+				let parsed: json::JsonValue = json::parse(text);
+				if parsed.kind() == "object" {
+					let message: string = field_string(parsed as json::JsonObject, "message");
+					if message.starts_with("uid:") {
+						uid = value_after_colon(message);
+					} else if message.starts_with("email:") {
+						email = value_after_colon(message);
+					} else if message.starts_with("name:") {
+						name = value_after_colon(message);
+					} else if message.starts_with("role:") {
+						role = value_after_colon(message);
+					} else if message.starts_with("tier:") {
+						tier = value_after_colon(message);
+					}
+				}
+			}
+		}
+	}
+	child.wait();
+	if clean.size() > 0 {
+		identity = clean;
+	} else if uid.size() > 0 || name.size() > 0 || email.size() > 0 {
+		let out: string = `{"authenticated":true`;
+		if uid.size() > 0 {
+			out = `${out},"uid":${new json::JsonString(uid).to_string()}`;
+		}
+		if email.size() > 0 {
+			out = `${out},"email":${new json::JsonString(email).to_string()}`;
+		}
+		if name.size() > 0 {
+			out = `${out},"name":${new json::JsonString(name).to_string()}`;
+		}
+		if role.size() > 0 {
+			out = `${out},"role":${new json::JsonString(role).to_string()}`;
+		}
+		if tier.size() > 0 {
+			out = `${out},"tier":${new json::JsonString(tier).to_string()}`;
+		}
+		identity = `${out}}`;
+	}
+	fs::write_file(account_cache_file(), identity);
+	return identity;
+}
+
+/// A minimal MCP stdio server. Claude Code calls the approval_prompt tool before
+/// any gated action. The server writes the request to a file, waits for the IDE
+/// to write a decision file, and returns allow or deny. This is written to disk
+/// so the agent CLI can spawn it with node. The text avoids backticks and the
+/// dollar-brace sequence so it embeds cleanly in this template string.
+let MCP_APPROVAL_JS: string = `\nimport { createInterface } from 'node:readline'\nimport { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'\nimport { randomUUID } from 'node:crypto'\nimport { join } from 'node:path'\n\nconst DIR = process.env.PEKO_APPROVAL_DIR || '.'\nconst rl = createInterface({ input: process.stdin })\nconst send = (m) => process.stdout.write(JSON.stringify(m) + String.fromCharCode(10))\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms))\n\nasync function decide(args) {\n  const id = randomUUID()\n  const reqPath = join(DIR, 'req-' + id + '.json')\n  const resPath = join(DIR, 'res-' + id + '.json')\n  const input = args.input || {}\n  try {\n    writeFileSync(reqPath, JSON.stringify({ id, tool_name: args.tool_name || 'tool', input, tool_use_id: args.tool_use_id || '' }))\n  } catch (e) {\n    return { behavior: 'allow', updatedInput: input }\n  }\n  const deadline = Date.now() + 1800000\n  while (Date.now() < deadline) {\n    if (existsSync(resPath)) {\n      let decision = { behavior: 'deny', message: 'No decision.' }\n      try { decision = JSON.parse(readFileSync(resPath, 'utf8')) } catch (e) {}\n      try { rmSync(reqPath) } catch (e) {}\n      try { rmSync(resPath) } catch (e) {}\n      if (decision.behavior === 'allow') return { behavior: 'allow', updatedInput: input }\n      return { behavior: 'deny', message: decision.message || 'The user declined this action.' }\n    }\n    await sleep(120)\n  }\n  try { rmSync(reqPath) } catch (e) {}\n  return { behavior: 'deny', message: 'Approval timed out.' }\n}\n\nrl.on('line', async (line) => {\n  if (!line.trim()) return\n  let msg\n  try { msg = JSON.parse(line) } catch (e) { return }\n  const id = msg.id\n  const method = msg.method\n  if (method === 'initialize') {\n    send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'approval', version: '1.0.0' } } })\n  } else if (method === 'tools/list') {\n    send({ jsonrpc: '2.0', id, result: { tools: [{ name: 'approval_prompt', description: 'Ask the user to approve a tool action.', inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' } } } }] } })\n  } else if (method === 'tools/call') {\n    const decision = await decide((msg.params && msg.params.arguments) || {})\n    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(decision) }] } })\n  } else if (method === 'notifications/initialized') {\n    return\n  } else if (id !== undefined && id !== null) {\n    send({ jsonrpc: '2.0', id, result: {} })\n  }\n})\n`;
+
+/// Whether node is on PATH. Node runs the MCP permission server. The result is
+/// checked per session start, which is infrequent.
+fn node_available() => bool {
+	let version_args: Array<string> = new Array<string>();
+	version_args.push("--version");
+	let spawned: process::Process? = spawn_agent_in("node", version_args, WORKSPACE_ROOT);
+	if !spawned.is_value() {
+		return false;
+	}
+	let child: process::Process = spawned.unwrap();
+	let line: string? = child.read_line();
+	child.wait();
+	return line.is_value();
+}
+
+/// Write the MCP server script and config, and reset the approval exchange
+/// directory. Returns the config path Claude Code loads, or empty on failure.
+fn prepare_approval_files() => string {
+	if !fs::write_file(mcp_script_file(), MCP_APPROVAL_JS) {
+		return "";
+	}
+	let dir: string = approvals_dir();
+	if fs::exists(dir) {
+		fs::remove(dir);
+	}
+	fs::make_dir(dir);
+	let script_json: string = new json::JsonString(mcp_script_file()).to_string();
+	let dir_json: string = new json::JsonString(dir).to_string();
+	let config: string = `{"mcpServers":{"approval":{"command":"node","args":[${script_json}],"env":{"PEKO_APPROVAL_DIR":${dir_json}}}}}`;
+	if !fs::write_file(mcp_config_file(), config) {
+		return "";
+	}
+	return mcp_config_file();
+}
+
+/// Watch the approval directory for request files and forward each new one to
+/// the chat panel as an approval event. Runs on its own thread and exits when
+/// the session generation changes.
+fn watch_approvals(application: ui::app::App, generation: number) {
+	threads::new_thread(
+		closure[application, generation]() => void {
+			let dir: string = approvals_dir();
+			let seen: Array<string> = new Array<string>();
+			while g_agent.generation == generation {
+				let names: Array<string> = fs::list_dir(dir);
+				let index: number = 0;
+				while index < names.size() {
+					let name: string = names[index];
+					if name.starts_with("req-") && name.ends_with(".json") {
+						let id: string = name.substring(4, name.size() - 5);
+						let already: bool = seen.contains_where(
+							closure[id](value: string) => bool {
+								return value == id;
+							},
+						);
+						if !already {
+							let content: string? = fs::read_file(`${dir}/${name}`);
+							if content.is_value() {
+								let parsed: json::JsonValue = json::parse(content.unwrap());
+								if parsed.kind() == "object" {
+									seen.push(id);
+									let request: json::JsonObject = parsed as json::JsonObject;
+									let tool: string = field_string(request, "tool_name");
+									let input_text: string = "{}";
+									let input_value: json::JsonValue? = request.get("input");
+									if input_value.is_value() {
+										input_text = input_value.unwrap().to_string();
+									}
+									let id_json: string = new json::JsonString(id).to_string();
+									let tool_json: string = new json::JsonString(tool).to_string();
+									application.emit(
+										"ide.agent:event",
+										`{"t":"approval","id":${id_json},"tool_name":${tool_json},"input":${input_text}}`,
+									);
+								}
+							}
+						}
+					}
+					index = index + 1;
+				}
+				threads::sleep_ms(120);
+			}
+		},
+	);
+}
+
+/// The streaming-JSON arguments for the agent CLI. Claude Code reads user and
+/// control (permission) messages as newline-delimited JSON on stdin and streams
+/// assistant, tool, result, and permission events as JSON on stdout. Centralized
+/// so a different agent CLI, model, or permission mode can be wired here.
+fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: string) => Array<string> {
+	// The "ask" and "acceptEdits" modes both run the CLI in default permission
+	// mode with the MCP approval tool, so every gated action is routed to the
+	// panel. The panel decides which to auto-approve (edits, in acceptEdits) and
+	// which to prompt for. The bypass and plan modes run without the prompt tool.
+	let permission_mode: string = mode;
+	if permission_mode.size() == 0 || permission_mode == "ask" || permission_mode == "acceptEdits" {
+		permission_mode = "default";
+	}
+	let args: Array<string> = new Array<string>();
+	args.push("--print");
+	args.push("--verbose");
+	args.push("--include-partial-messages");
+	args.push("--output-format");
+	args.push("stream-json");
+	args.push("--input-format");
+	args.push("stream-json");
+	args.push("--permission-mode");
+	args.push(permission_mode);
+	// Route permission decisions through the approval MCP server when present.
+	if mcp_config.size() > 0 {
+		args.push("--mcp-config");
+		args.push(mcp_config);
+		args.push("--permission-prompt-tool");
+		args.push("mcp__approval__approval_prompt");
+	}
+	// Load the Peko development skill as a session plugin.
+	if plugin_dir.size() > 0 {
+		args.push("--plugin-dir");
+		args.push(plugin_dir);
+	}
+	// Resume a prior session (a thread the panel is continuing).
+	if resume.size() > 0 {
+		args.push("--resume");
+		args.push(resume);
+	}
+	return args;
+}
+
+/// Launch the agent CLI in `dir`. On macOS and Linux it goes through env with
+/// the resolved shell PATH, so a Finder or Dock launch finds a CLI installed
+/// under the user's shell (homebrew, nvm, npm global). Windows GUI apps inherit
+/// the system PATH, so the command runs directly.
+fn spawn_agent_in(command: string, args: Array<string>, dir: string) => process::Process? {
+	if env::os() == "windows" {
+		return process::spawn_in(command, args, dir);
+	}
+	let env_args: Array<string> = new Array<string>();
+	env_args.push(`PATH=${resolve_path()}`);
+	env_args.push(command);
+	let index: number = 0;
+	while index < args.size() {
+		env_args.push(args[index]);
+		index = index + 1;
+	}
+	return process::spawn_in("/usr/bin/env", env_args, dir);
+}
+
+/// Stream an agent child to the chat panel. Each stdout line is a JSON event
+/// (assistant, tool_use, result, or a control/permission request), forwarded
+/// as-is under ide.agent:event. Non-JSON stdout and all stderr are wrapped as
+/// log/stderr meta events (distinguished by a `t` field the agent events lack).
+/// On exit an exit event is emitted. Runs the wait on a new thread so start
+/// returns at once.
+fn stream_agent(application: ui::app::App, child: process::Process) {
+	threads::new_thread(
+		closure[application, child]() => void {
+			child.on_output(
+				closure[application](line: string) => void {
+					if line.size() == 0 {
+						return;
+					}
+					if line.starts_with("{") {
+						application.emit("ide.agent:event", line);
+					} else {
+						let text_json: string = new json::JsonString(line).to_string();
+						application.emit("ide.agent:event", `{"t":"log","text":${text_json}}`);
+					}
+				},
+			);
+			child.on_error(
+				closure[application](line: string) => void {
+					let text_json: string = new json::JsonString(line).to_string();
+					application.emit("ide.agent:event", `{"t":"stderr","text":${text_json}}`);
+				},
+			);
+			let code: number = child.wait();
+			application.emit("ide.agent:event", `{"t":"exit","code":${code}}`);
+		},
+	);
+}
+
+/// The string value of an object field, or empty when absent or not a string.
+fn field_string(object: json::JsonObject, key: string) => string {
+	let found: json::JsonValue? = object.get(key);
+	if !found.is_value() {
+		return "";
+	}
+	let value: json::JsonValue = found.unwrap();
+	if value.kind() != "string" {
+		return "";
+	}
+	return value as json::JsonString.get();
+}
+
+/// Convert one `git status --porcelain` line into a JSON status entry, or an
+/// empty string when the line is too short to parse. The two status columns are
+/// the index and worktree states; a rename line carries "old -> new" and the new
+/// path is kept. Paths are resolved against the workspace root so they match the
+/// file tree.
+fn git_entry_json(raw: string) => string {
+	if raw.size() < 4 {
+		return "";
+	}
+	let index_state: string = raw.substring(0, 1);
+	let worktree_state: string = raw.substring(1, 2);
+	let rest: string = raw.substring(3, raw.size());
+
+	let arrow: number = rest.index_of(" -> ");
+	if arrow >= 0 {
+		rest = rest.substring(arrow + 4, rest.size());
+	}
+
+	let status: string = "modified";
+	if index_state == "?" && worktree_state == "?" {
+		status = "untracked";
+	} else if index_state == "A" || worktree_state == "A" {
+		status = "added";
+	} else if index_state == "D" || worktree_state == "D" {
+		status = "deleted";
+	} else if index_state == "R" || worktree_state == "R" {
+		status = "renamed";
+	}
+
+	let absolute: string = `${WORKSPACE_ROOT}/${rest}`;
+	let path_json: string = new json::JsonString(absolute).to_string();
+	return `{"path":${path_json},"status":"${status}"}`;
+}
+
+/// Writes a binary string to disk byte-exact. The FileHandle write path carries
+/// the byte count, so embedded null bytes survive. Returns true on success.
+fn write_binary_file(path: string, bytes: string) => bool {
+	let file: fs::File = new fs::File(path);
+	let opened: fs::FileHandle? = file.open(fs::OpenMode::Write);
+	if !opened.is_value() {
+		return false;
+	}
+	let handle: fs::FileHandle = opened.unwrap();
+	let length: i64 = danger_cast<i64>(bytes.size().to_raw());
+	let buffer: fs::Buffer = new fs::Buffer(bytes.to_raw(), length);
+	let wrote: number? = handle.write(buffer);
+	handle.close();
+	return wrote.is_value();
+}
+
+/// Relay the language server to the editor over a WebSocket on an ephemeral
+/// loopback port, returned so the editor can connect to it. Binding port 0
+/// means multiple app instances never collide on a fixed port. Does not fork;
+/// the child is already spawned. Returns 0 when the server could not bind.
+fn start_lsp_relay(lsp: process::Process) => number {
+	let server: sockets::WebSocket = new sockets::WebSocket();
+	let started: threads::Mutex<Flag> = new threads::Mutex<Flag>(new Flag());
+	let editor: threads::Mutex<EditorFd> = new threads::Mutex<EditorFd>(new EditorFd());
+
+	// editor -> lsp: each WebSocket text frame is one whole JSON-RPC message.
+	server.set_callback(
+		closure[lsp](connection: sockets::WsConnection, request: sockets::Request) => void {
+			write_lsp_frame(lsp, request.get_request());
+		},
+	);
+
+	// Track the live editor connection. The reader thread starts once and always
+	// forwards to whichever connection is current, so a reload that reconnects
+	// keeps receiving language-server output.
+	server.set_on_open(
+		closure[lsp, started, editor](connection: sockets::WsConnection) => void {
+			let live: EditorFd = editor.lock();
+			live.value = connection.id();
+			editor.release();
+
+			let flag: Flag = started.lock();
+			let first: bool = !flag.value;
+			flag.value = true;
+			started.release();
+			if !first {
+				return;
+			}
+
+			threads::new_thread(
+				closure[lsp, editor]() => void {
+					let reading: bool = true;
+					while reading {
+						let frame: string? = read_lsp_frame(lsp);
+						if frame.is_value() {
+							let current: EditorFd = editor.lock();
+							let fd: number = current.value;
+							editor.release();
+							if fd > 0 {
+								let target: sockets::WsConnection = new sockets::WsConnection(danger_cast<i32>(fd.to_raw()));
+								target.send(frame.unwrap());
+							}
+						} else {
+							reading = false;
+						}
+					}
+				},
+			);
+		},
+	);
+
+	server.listen();
+
+	// The listen thread binds the socket and records the assigned port. Poll for
+	// it (it binds within a few milliseconds) so the editor can be told where to
+	// connect.
+	let port: number = 0;
+	let tries: number = 0;
+	while tries < 200 {
+		port = server.get_port();
+		if port > 0 {
+			return port;
+		}
+		threads::sleep_ms(5);
+		tries = tries + 1;
+	}
+	return port;
+}
+
+/// The directory containing `path` (the part before the last separator), or
+/// "/" when there is no separator.
+fn parent_dir(path: string) => string {
+	let cut: number = -1;
+	let index: number = 0;
+	while index < path.size() {
+		if path.substring(index, index + 1) == "/" {
+			cut = index;
+		}
+		index = index + 1;
+	}
+	if cut <= 0 {
+		return "/";
+	}
+	return path.substring(0, cut);
+}
+
+/// Convert forward slashes in a path to backslashes. Windows Explorer, and its
+/// /select switch in particular, resolve a path only with backslash separators.
+fn to_windows_path(path: string) => string {
+	let backslash: string = "\\";
+	let out: string = "";
+	let index: number = 0;
+	while index < path.size() {
+		let ch: string = path.substring(index, index + 1);
+		if ch == "/" {
+			out = `${out}${backslash}`;
+		} else {
+			out = `${out}${ch}`;
+		}
+		index = index + 1;
+	}
+	return out;
+}
+
+/// The workspace root the editor opens, from PEKO_IDE_PROJECT. Empty when no
+/// project is set: the window then opens the project launcher instead of the
+/// editor, and the launcher starts a new window with the root once one is
+/// chosen.
+fn resolve_workspace_root() => string {
+	return env::get("PEKO_IDE_PROJECT");
+}
+
+/// The entry source file for a project root, read from the peko.toml `entry`
+/// key. Falls back to source/main.peko when the manifest has no entry, and is
+/// empty when there is no project (launcher mode).
+fn project_entry(root: string) => string {
+	if root.size() == 0 {
+		return "";
+	}
+	let fallback: string = `${root}/source/main.peko`;
+	let manifest: string? = fs::read_file(`${root}/peko.toml`);
+	if !manifest.is_value() {
+		return fallback;
+	}
+	let text: string = manifest.unwrap();
+	if !text.contains("entry") {
+		return fallback;
+	}
+	let one: number = 1;
+	let marker: number = text.index_of("entry");
+	let rest: string = text.substring(marker, text.size());
+	if !rest.contains("\"") {
+		return fallback;
+	}
+	let first: number = rest.index_of("\"");
+	let after: string = rest.substring(first + one, rest.size());
+	if !after.contains("\"") {
+		return fallback;
+	}
+	let second: number = after.index_of("\"");
+	let entry: string = after.substring(0, second);
+	if entry.size() == 0 {
+		return fallback;
+	}
+	return `${root}/${entry}`;
+}
+
+/// True when path holds a Peko project (a peko.toml manifest).
+fn is_project(path: string) => bool {
+	return fs::exists(`${path}/peko.toml`);
+}
+
+/// The last path segment of a project root, used as its display name.
+fn project_name_of(path: string) => string {
+	let one: number = 1;
+	let cleaned: string = path;
+	let size: number = cleaned.size();
+	if size > 0 {
+		let last: string = cleaned.substring(size - one, size);
+		if last == "/" {
+			cleaned = cleaned.substring(0, size - one);
+		}
+	}
+	let index: number = 0;
+	let start: number = 0;
+	while index < cleaned.size() {
+		let ch: string = cleaned.substring(index, index + one);
+		if ch == "/" {
+			start = index + one;
+		}
+		index = index + one;
+	}
+	return cleaned.substring(start, cleaned.size());
+}
+
+/// The recent-projects store file, under the user's home. The directory is
+/// created on first use.
+fn recents_file() => string {
+	let home: string = env::get("HOME");
+	let dir: string = `${home}/.peko-studio`;
+	fs::make_dir(dir);
+	return `${dir}/recents.json`;
+}
+
+/// The path of the editor preferences store. The web UI cannot rely on
+/// localStorage because the loopback asset server binds a fresh port each launch,
+/// so its origin (and any per-origin storage) changes every run. Preferences are
+/// kept here instead so they survive restarts.
+fn prefs_file() => string {
+	let home: string = env::get("HOME");
+	let dir: string = `${home}/.peko-studio`;
+	fs::make_dir(dir);
+	return `${dir}/prefs.json`;
+}
+
+/// The recent project roots, most recent first. Empty when none are stored or
+/// the store is unreadable.
+fn read_recents() => Array<string> {
+	let list: Array<string> = new Array<string>();
+	let content: string? = fs::read_file(recents_file());
+	if !content.is_value() {
+		return list;
+	}
+	let value: json::JsonValue = json::parse(content.unwrap());
+	if value.kind() != "array" {
+		return list;
+	}
+	let array: json::JsonArray = value as json::JsonArray;
+	let count: number = array.size();
+	let index: number = 0;
+	let one: number = 1;
+	while index < count {
+		let item: json::JsonValue = array.at(index);
+		if item.kind() == "string" {
+			list.push(item as json::JsonString.get());
+		}
+		index = index + one;
+	}
+	return list;
+}
+
+/// Record path as the most recent project: move it to the front, drop a
+/// duplicate, and keep the list bounded.
+fn add_recent(path: string) {
+	let existing: Array<string> = read_recents();
+	let ordered: Array<string> = new Array<string>();
+	ordered.push(path);
+	let one: number = 1;
+	let limit: number = 12;
+	let index: number = 0;
+	while index < existing.size() {
+		let candidate: string = existing[index];
+		if candidate != path {
+			if ordered.size() < limit {
+				ordered.push(candidate);
+			}
+		}
+		index = index + one;
+	}
+	let array: json::JsonArray = new json::JsonArray();
+	let write_index: number = 0;
+	while write_index < ordered.size() {
+		array.push(new json::JsonString(ordered[write_index]));
+		write_index = write_index + one;
+	}
+	fs::write_file(recents_file(), array.to_string());
+}
+
+/// Open a project in a new editor window by starting another instance of this
+/// app with PEKO_IDE_PROJECT set to its root.
+fn open_project_window(path: string) => bool {
+	let exe: string = env::self_exe();
+	if exe.size() == 0 {
+		return false;
+	}
+	add_recent(path);
+	env::set("PEKO_IDE_PROJECT", path);
+	let args: Array<string> = new Array<string>();
+	let started: process::Process? = process::spawn(exe, args);
+	return started.is_value();
+}
+
+/// Open the project launcher in a new window by starting another instance of
+/// this app with no project set.
+fn open_launcher_window() => bool {
+	let exe: string = env::self_exe();
+	if exe.size() == 0 {
+		return false;
+	}
+	env::set("PEKO_IDE_PROJECT", "");
+	let args: Array<string> = new Array<string>();
+	let started: process::Process? = process::spawn(exe, args);
+	return started.is_value();
+}
+
+/// Scaffold a new project with `peko project new` (non-interactive) under dir,
+/// and return its root path, or empty on failure.
+fn create_project(dir: string, name: string, ui_project: bool, framework: string) => string {
+	let args: Array<string> = new Array<string>();
+	args.push("project");
+	args.push("new");
+	args.push(`--name=${name}`);
+	args.push(`--dir=${dir}`);
+	if ui_project {
+		if framework.size() > 0 {
+			args.push(`--framework=${framework}`);
+		}
+	} else {
+		args.push("--no-ui");
+	}
+	let spawned: process::Process? = spawn_peko_in(args, dir);
+	if !spawned.is_value() {
+		return "";
+	}
+	let child: process::Process = spawned.unwrap();
+	let code: number = child.wait();
+	if code != 0 {
+		return "";
+	}
+	return `${dir}/${name}`;
+}
+
+/// The string value of a JSON object field, or empty when absent or not a
+/// string.
+fn opt_string(object: json::JsonObject, key: string) => string {
+	let found: json::JsonValue? = object.get(key);
+	if !found.is_value() {
+		return "";
+	}
+	let value: json::JsonValue = found.unwrap();
+	if value.kind() != "string" {
+		return "";
+	}
+	return value as json::JsonString.get();
+}
+
+/// The boolean value of a JSON object field, or fallback when absent or not a
+/// boolean.
+fn opt_bool(object: json::JsonObject, key: string, fallback: bool) => bool {
+	let found: json::JsonValue? = object.get(key);
+	if !found.is_value() {
+		return fallback;
+	}
+	let text: string = found.unwrap().to_string();
+	if text == "true" {
+		return true;
+	}
+	if text == "false" {
+		return false;
+	}
+	return fallback;
+}
+
+/// Register the workspace bridge handlers the editor calls over the pekoui
+/// bridge. ide.entry returns the project root, the entry file path, its text,
+/// and the language-server relay port so the editor can open a real project
+/// file with language support.
+fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
+	application.on(
+		"ide.entry",
+		closure[lsp_port](params: string) => string {
+			// No project set: this window is the launcher, not the editor.
+			if WORKSPACE_ROOT.size() == 0 {
+				return `{"launcher":true}`;
+			}
+			let content: string? = fs::read_file(ENTRY_FILE);
+			let text: string = "";
+			if content.is_value() {
+				text = content.unwrap();
+			}
+			let root_json: string = new json::JsonString(WORKSPACE_ROOT).to_string();
+			let path_json: string = new json::JsonString(ENTRY_FILE).to_string();
+			let text_json: string = new json::JsonString(text).to_string();
+			return `{"launcher":false,"root":${root_json},"path":${path_json},"text":${text_json},"lspPort":${lsp_port}}`;
+		},
+	);
+
+	// ide.projects.recent returns the recent project roots for the launcher,
+	// most recent first. Reply: {projects:[{path, name, exists}]}.
+	application.on(
+		"ide.projects.recent",
+		closure(params: string) => string {
+			let recents: Array<string> = read_recents();
+			let out: string = "";
+			let index: number = 0;
+			let one: number = 1;
+			while index < recents.size() {
+				let root: string = recents[index];
+				let root_json: string = new json::JsonString(root).to_string();
+				let name_json: string = new json::JsonString(project_name_of(root)).to_string();
+				let exists: string = "false";
+				if is_project(root) {
+					exists = "true";
+				}
+				let item: string = `{"path":${root_json},"name":${name_json},"exists":${exists}}`;
+				if index > 0 {
+					out = `${out},`;
+				}
+				out = `${out}${item}`;
+				index = index + one;
+			}
+			return `{"projects":[${out}]}`;
+		},
+	);
+
+	// ide.projects.open opens a project in a new editor window. Params: {path}.
+	application.on(
+		"ide.projects.open",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			if value.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let object: json::JsonObject = value as json::JsonObject;
+			let path: string = opt_string(object, "path");
+			if path.size() == 0 {
+				return `{"ok":false,"error":"path required"}`;
+			}
+			if !is_project(path) {
+				return `{"ok":false,"error":"not a Peko project"}`;
+			}
+			let ok: bool = open_project_window(path);
+			if ok {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false,"error":"could not open window"}`;
+		},
+	);
+
+	// ide.projects.new scaffolds a project and opens it. Params: {name, dir,
+	// ui, framework}. dir defaults to the user's home. Reply: {ok, path?, error?}.
+	application.on(
+		"ide.projects.new",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			if value.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let object: json::JsonObject = value as json::JsonObject;
+			let name: string = opt_string(object, "name");
+			let dir: string = opt_string(object, "dir");
+			let framework: string = opt_string(object, "framework");
+			let ui_project: bool = opt_bool(object, "ui", true);
+			if name.size() == 0 {
+				return `{"ok":false,"error":"name required"}`;
+			}
+			if dir.size() == 0 {
+				dir = home_dir();
+			}
+			let created: string = create_project(dir, name, ui_project, framework);
+			if created.size() == 0 {
+				return `{"ok":false,"error":"could not create project"}`;
+			}
+			open_project_window(created);
+			let path_json: string = new json::JsonString(created).to_string();
+			return `{"ok":true,"path":${path_json}}`;
+		},
+	);
+
+	// ide.packages.add installs a dependency with `peko add`. A global install
+	// goes into the shared global manifest instead of the project. Params: {name,
+	// version?, path?, global?}. Reply: {ok, output}.
+	application.on(
+		"ide.packages.add",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			if value.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let object: json::JsonObject = value as json::JsonObject;
+			let name: string = opt_string(object, "name");
+			if name.size() == 0 {
+				return `{"ok":false,"output":"package name required"}`;
+			}
+			let version: string = opt_string(object, "version");
+			let path: string = opt_string(object, "path");
+			let scope: string = opt_string(object, "global");
+			let args: Array<string> = new Array<string>();
+			args.push("add");
+			args.push(name);
+			if version.size() > 0 {
+				args.push(`--version=${version}`);
+			}
+			if path.size() > 0 {
+				args.push(`--path=${path}`);
+			}
+			if scope == "true" {
+				args.push("--global");
+			}
+			return run_peko_result(args);
+		},
+	);
+
+	// ide.packages.remove removes a dependency with `peko remove`. Params:
+	// {name}. Reply: {ok, output}.
+	application.on(
+		"ide.packages.remove",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			if value.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let object: json::JsonObject = value as json::JsonObject;
+			let name: string = opt_string(object, "name");
+			if name.size() == 0 {
+				return `{"ok":false,"output":"package name required"}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("remove");
+			args.push(name);
+			return run_peko_result(args);
+		},
+	);
+
+	// ide.account.status returns the cached platform identity without touching
+	// the keychain. Reply: the identity object, or {authenticated:false}.
+	application.on(
+		"ide.account.status",
+		closure(params: string) => string {
+			let cached: string? = fs::read_file(account_cache_file());
+			if !cached.is_value() {
+				return `{"authenticated":false}`;
+			}
+			let value: json::JsonValue = json::parse(cached.unwrap());
+			if value.kind() != "object" {
+				return `{"authenticated":false}`;
+			}
+			return cached.unwrap();
+		},
+	);
+
+	// ide.account.refresh re-reads the identity from the platform (touches the
+	// keychain once) and updates the cache. Runs off the bridge thread and
+	// reports the result on ide.account:changed. Reply: {ok}.
+	application.on(
+		"ide.account.refresh",
+		closure[application](params: string) => string {
+			threads::new_thread(
+				closure[application]() => void {
+					let identity: string = refresh_account_identity();
+					application.emit("ide.account:changed", identity);
+				},
+			);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.account.login runs `peko login` (the browser sign-in flow) and, on
+	// success, refreshes and caches the identity. Runs on its own thread since the
+	// flow waits on the browser. Result on ide.account:changed. Reply: {ok}.
+	application.on(
+		"ide.account.login",
+		closure[application](params: string) => string {
+			threads::new_thread(
+				closure[application]() => void {
+					let args: Array<string> = new Array<string>();
+					args.push("login");
+					let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+					if spawned.is_value() {
+						spawned.unwrap().wait();
+					}
+					let identity: string = refresh_account_identity();
+					application.emit("ide.account:changed", identity);
+				},
+			);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.account.logout clears the platform session with `peko logout` and drops
+	// the cached identity. Reply: {authenticated:false}.
+	application.on(
+		"ide.account.logout",
+		closure[application](params: string) => string {
+			let args: Array<string> = new Array<string>();
+			args.push("logout");
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if spawned.is_value() {
+				spawned.unwrap().wait();
+			}
+			fs::remove(account_cache_file());
+			application.emit("ide.account:changed", `{"authenticated":false}`);
+			return `{"authenticated":false}`;
+		},
+	);
+
+	// ide.open_launcher opens the project launcher in a new window. The caller
+	// closes its own window afterward to replace it. Reply: {ok}.
+	application.on(
+		"ide.open_launcher",
+		closure(params: string) => string {
+			if open_launcher_window() {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.project_sources returns every .peko source file under the project root,
+	// skipping build output and dependency trees, so the editor can open them all
+	// to the language server for project-wide diagnostics. Reply: {files:[...]}.
+	application.on(
+		"ide.project_sources",
+		closure(params: string) => string {
+			let all: Array<string> = fs::walk(WORKSPACE_ROOT, 20);
+			let out: string = "";
+			let index: number = 0;
+			let one: number = 1;
+			let five: number = 5;
+			let first: bool = true;
+			while index < all.size() {
+				let path: string = all[index];
+				let size: number = path.size();
+				let keep: bool = false;
+				if size > five {
+					if path.substring(size - five, size) == ".peko" {
+						keep = true;
+					}
+				}
+				if keep {
+					if path.contains("/node_modules/") {
+						keep = false;
+					}
+				}
+				if keep {
+					if path.contains("/.peko/") {
+						keep = false;
+					}
+				}
+				if keep {
+					if path.contains("/build/") {
+						keep = false;
+					}
+				}
+				if keep {
+					if path.contains("/.git/") {
+						keep = false;
+					}
+				}
+				if keep {
+					let path_json: string = new json::JsonString(path).to_string();
+					if !first {
+						out = `${out},`;
+					}
+					out = `${out}${path_json}`;
+					first = false;
+				}
+				index = index + one;
+			}
+			return `{"files":[${out}]}`;
+		},
+	);
+
+	// ide.watch sets the files the watcher polls for external changes. Params:
+	// {paths:[...]}. Reply: {ok}.
+	application.on(
+		"ide.watch",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			let list: Array<string> = new Array<string>();
+			if value.kind() == "object" {
+				let object: json::JsonObject = value as json::JsonObject;
+				let found: json::JsonValue? = object.get("paths");
+				if found.is_value() {
+					let raw: json::JsonValue = found.unwrap();
+					if raw.kind() == "array" {
+						let array: json::JsonArray = raw as json::JsonArray;
+						let count: number = array.size();
+						let index: number = 0;
+						let one: number = 1;
+						while index < count {
+							let item: json::JsonValue = array.at(index);
+							if item.kind() == "string" {
+								list.push(item as json::JsonString.get());
+							}
+							index = index + one;
+						}
+					}
+				}
+			}
+			let holder: WatchList = g_watch.lock();
+			holder.paths = list;
+			g_watch.release();
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.watch_dirs sets the directories the watcher polls for tree changes.
+	// Params: {paths:[...]}. Reply: {ok}.
+	application.on(
+		"ide.watch_dirs",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			let list: Array<string> = new Array<string>();
+			if value.kind() == "object" {
+				let object: json::JsonObject = value as json::JsonObject;
+				let found: json::JsonValue? = object.get("paths");
+				if found.is_value() {
+					let raw: json::JsonValue = found.unwrap();
+					if raw.kind() == "array" {
+						let array: json::JsonArray = raw as json::JsonArray;
+						let count: number = array.size();
+						let index: number = 0;
+						let one: number = 1;
+						while index < count {
+							let item: json::JsonValue = array.at(index);
+							if item.kind() == "string" {
+								list.push(item as json::JsonString.get());
+							}
+							index = index + one;
+						}
+					}
+				}
+			}
+			let holder: WatchList = g_watch_dirs.lock();
+			holder.paths = list;
+			g_watch_dirs.release();
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.pick_folder opens the native folder chooser and returns the chosen
+	// absolute path (empty when cancelled or unsupported). Reply: {path}.
+	application.on(
+		"ide.pick_folder",
+		closure(params: string) => string {
+			let chosen: string = ui::dialog::pick_folder("Choose a Project Folder");
+			let path_json: string = new json::JsonString(chosen).to_string();
+			return `{"path":${path_json}}`;
+		},
+	);
+
+	// ide.save writes an editor buffer back to disk. Params: {path, text}.
+	application.on(
+		"ide.save",
+		closure(params: string) => string {
+			let value: json::JsonValue = json::parse(params);
+			if value.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let object: json::JsonObject = value as json::JsonObject;
+			let path_value: json::JsonValue? = object.get("path");
+			let text_value: json::JsonValue? = object.get("text");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			if !text_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			let text: string = text_value.unwrap() as json::JsonString.get();
+			let ok: bool = fs::write_file(path, text);
+			if ok {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.icon.save writes the icon builder's composited master PNG to disk. The
+	// PNG crosses the bridge as base64 text in `data` and is decoded here so the
+	// bytes stay exact. The parent directory is created when absent. Params:
+	// {path, data}. Reply: {ok}.
+	application.on(
+		"ide.icon.save",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path: string = field_string(request, "path");
+			let data: string = field_string(request, "data");
+			if path.size() == 0 || data.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let decoded: string? = crypto::from_base64(data);
+			if !decoded.is_value() {
+				return `{"ok":false}`;
+			}
+			fs::make_dir(parent_dir(path));
+			let ok: bool = write_binary_file(path, decoded.unwrap());
+			if ok {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.git.status returns the current branch and the changed paths for the
+	// workspace, from `git status --porcelain`. Paths are absolute so the file
+	// tree can decorate them. Reply: {branch, entries:[{path, status}]}. An empty
+	// reply is returned when the workspace is not a git repository.
+	application.on(
+		"ide.git.status",
+		closure(params: string) => string {
+			let branch: string = "";
+			let branch_args: Array<string> = new Array<string>();
+			branch_args.push("rev-parse");
+			branch_args.push("--abbrev-ref");
+			branch_args.push("HEAD");
+			let branch_proc: process::Process? = process::spawn_in("git", branch_args, WORKSPACE_ROOT);
+			if branch_proc.is_value() {
+				let branch_child: process::Process = branch_proc.unwrap();
+				let branch_line: string? = branch_child.read_line();
+				if branch_line.is_value() {
+					branch = branch_line.unwrap();
+				}
+				branch_child.wait();
+			}
+
+			let status_args: Array<string> = new Array<string>();
+			status_args.push("status");
+			status_args.push("--porcelain");
+			let spawned: process::Process? = process::spawn_in("git", status_args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				return `{"branch":"","entries":[]}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			let joined: string = "";
+			let count: number = 0;
+			let line: string? = child.read_line();
+			while line.is_value() {
+				let entry: string = git_entry_json(line.unwrap());
+				if entry.size() > 0 {
+					if count > 0 {
+						joined = `${joined},`;
+					}
+					joined = `${joined}${entry}`;
+					count = count + 1;
+				}
+				line = child.read_line();
+			}
+			child.wait();
+
+			let branch_json: string = new json::JsonString(branch).to_string();
+			return `{"branch":${branch_json},"entries":[${joined}]}`;
+		},
+	);
+
+	// ide.prefs.get returns the stored editor preferences as a JSON object, or an
+	// empty object when none are stored. Reply: the preferences object.
+	application.on(
+		"ide.prefs.get",
+		closure(params: string) => string {
+			let content: string? = fs::read_file(prefs_file());
+			if !content.is_value() {
+				return `{}`;
+			}
+			let value: json::JsonValue = json::parse(content.unwrap());
+			if value.kind() != "object" {
+				return `{}`;
+			}
+			return content.unwrap();
+		},
+	);
+
+	// ide.prefs.set writes the whole preferences object. The web UI merges its
+	// change into the current object and sends the result as `data`, so the store
+	// stays a single JSON object. Params: {data}. Reply: {ok}.
+	application.on(
+		"ide.prefs.set",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let data: string = field_string(request, "data");
+			if data.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let ok: bool = fs::write_file(prefs_file(), data);
+			if ok {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.agent.status reports whether the agent CLI is installed and reachable,
+	// by running it with --version. Reply: {available, version?}.
+	application.on(
+		"ide.agent.status",
+		closure(params: string) => string {
+			let version_args: Array<string> = new Array<string>();
+			version_args.push("--version");
+			let spawned: process::Process? = spawn_agent_in(agent_command(), version_args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				return `{"available":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			let line: string? = child.read_line();
+			child.wait();
+			if !line.is_value() {
+				return `{"available":false}`;
+			}
+			let version_json: string = new json::JsonString(line.unwrap()).to_string();
+			return `{"available":true,"version":${version_json}}`;
+		},
+	);
+
+	// ide.agent.start launches the agent CLI in the workspace as a streaming
+	// session and forwards its JSON events over ide.agent:event. A running
+	// session is stopped first. Reply: {ok}.
+	application.on(
+		"ide.agent.start",
+		closure[application](params: string) => string {
+			if g_agent.child.is_value() {
+				g_agent.child.unwrap().kill();
+				g_agent.child = None;
+			}
+			let parsed: json::JsonValue = json::parse(params);
+			let mode: string = "ask";
+			let resume: string = "";
+			if parsed.kind() == "object" {
+				let request: json::JsonObject = parsed as json::JsonObject;
+				mode = field_string(request, "mode");
+				resume = field_string(request, "resume");
+			}
+			// New session generation stops the previous approval watcher.
+			g_agent.generation = g_agent.generation + 1;
+			let generation: number = g_agent.generation;
+			// Interactive modes route permissions through the approval server when
+			// node is available. Bypass and plan modes run without prompts.
+			let wants_prompts: bool = mode.size() == 0 || mode == "ask" || mode == "acceptEdits";
+			let mcp_config: string = "";
+			if wants_prompts && node_available() {
+				mcp_config = prepare_approval_files();
+			}
+			// Pass the plugin dir when the panel has installed the skill there.
+			let plugin_dir: string = "";
+			if fs::exists(`${agent_plugin_dir()}/.claude-plugin/plugin.json`) {
+				plugin_dir = agent_plugin_dir();
+			}
+			let spawned: process::Process? = spawn_agent_in(
+				agent_command(),
+				agent_args(mode, resume, mcp_config, plugin_dir),
+				WORKSPACE_ROOT,
+			);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.agent:event",
+					`{"t":"error","message":"could not launch the agent CLI (is it installed and on PATH?)"}`,
+				);
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			g_agent.child = child;
+			stream_agent(application, child);
+			if mcp_config.size() > 0 {
+				watch_approvals(application, generation);
+			}
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.agent.input writes one newline-delimited JSON line to the agent's
+	// stdin. The chat panel builds the line (a user message or a permission
+	// control response). Params: {line}. Reply: {ok}.
+	application.on(
+		"ide.agent.input",
+		closure(params: string) => string {
+			if !g_agent.child.is_value() {
+				return `{"ok":false}`;
+			}
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let line: string = field_string(parsed as json::JsonObject, "line");
+			if line.size() == 0 {
+				return `{"ok":false}`;
+			}
+			g_agent.child.unwrap().write_line(line);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.agent.stop closes the agent's input and terminates it. Reply: {ok}.
+	application.on(
+		"ide.agent.stop",
+		closure(params: string) => string {
+			// Advance the generation so the approval watcher thread exits.
+			g_agent.generation = g_agent.generation + 1;
+			if g_agent.child.is_value() {
+				let child: process::Process = g_agent.child.unwrap();
+				child.close_input();
+				child.kill();
+				g_agent.child = None;
+			}
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.agent.approve records the user's decision on a pending action. The
+	// approval MCP server is polling for this file and returns it to the agent.
+	// Params: {id, behavior}. Reply: {ok}.
+	application.on(
+		"ide.agent.approve",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let id: string = field_string(request, "id");
+			let behavior: string = field_string(request, "behavior");
+			if id.size() == 0 || behavior.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let decision: string = `{"behavior":"deny","message":"The user declined this action."}`;
+			if behavior == "allow" {
+				decision = `{"behavior":"allow"}`;
+			}
+			let path: string = `${approvals_dir()}/res-${id}.json`;
+			if fs::write_file(path, decision) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.agent.install_plugin writes the Peko development skill plugin into the
+	// IDE-owned plugin directory. The panel sends the skill and manifest text.
+	// Params: {skill, manifest}. Reply: {ok}.
+	application.on(
+		"ide.agent.install_plugin",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let skill: string = field_string(request, "skill");
+			let manifest: string = field_string(request, "manifest");
+			if skill.size() == 0 || manifest.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let root: string = agent_plugin_dir();
+			fs::make_dir(root);
+			fs::make_dir(`${root}/.claude-plugin`);
+			fs::make_dir(`${root}/skills`);
+			fs::make_dir(`${root}/skills/peko-development`);
+			let wrote_manifest: bool = fs::write_file(`${root}/.claude-plugin/plugin.json`, manifest);
+			let wrote_skill: bool = fs::write_file(`${root}/skills/peko-development/SKILL.md`, skill);
+			if wrote_manifest && wrote_skill {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.agent.threads.get returns the saved chat threads for this workspace as
+	// a JSON array, or an empty array when there are none.
+	application.on(
+		"ide.agent.threads.get",
+		closure(params: string) => string {
+			let content: string? = fs::read_file(threads_file());
+			if !content.is_value() {
+				return `[]`;
+			}
+			let value: json::JsonValue = json::parse(content.unwrap());
+			if value.kind() != "array" {
+				return `[]`;
+			}
+			return content.unwrap();
+		},
+	);
+
+	// ide.agent.threads.set writes the chat threads for this workspace. The panel
+	// sends the whole array as `data`. Params: {data}. Reply: {ok}.
+	application.on(
+		"ide.agent.threads.set",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let data: string = field_string(parsed as json::JsonObject, "data");
+			if data.size() == 0 {
+				return `{"ok":false}`;
+			}
+			if fs::write_file(threads_file(), data) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.list returns the immediate children of a directory for the file
+	// explorer. Params: {path}; defaults to the workspace root. Directories sort
+	// before files. Reply: {path, entries:[{name, path, dir}]}.
+	// ide.search runs `peko search` (regex/glob/replace-capable, in a subprocess
+	// off the bridge thread) across the workspace. Params: {query, regex, case,
+	// word, include, exclude} (the flags are non-empty strings when on). Reply:
+	// the search JSON {matches:[...],truncated,error?}.
+	application.on(
+		"ide.search",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"matches":[],"truncated":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let query: string = field_string(request, "query");
+			if query.size() == 0 {
+				return `{"matches":[],"truncated":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("search");
+			args.push(`--query=${query}`);
+			if field_string(request, "regex").size() > 0 {
+				args.push("--regex");
+			}
+			if field_string(request, "case").size() > 0 {
+				args.push("--case");
+			}
+			if field_string(request, "word").size() > 0 {
+				args.push("--word");
+			}
+			let include: string = field_string(request, "include");
+			if include.size() > 0 {
+				args.push(`--include=${include}`);
+			}
+			let exclude: string = field_string(request, "exclude");
+			if exclude.size() > 0 {
+				args.push(`--exclude=${exclude}`);
+			}
+			let output: string = run_peko_capture(args);
+			if output.size() == 0 {
+				return `{"matches":[],"truncated":false}`;
+			}
+			return output;
+		},
+	);
+
+	// ide.replace runs `peko search --replace` to substitute every match across
+	// the workspace in place. Params: same as ide.search plus {replace}. Reply:
+	// {replaced,files}.
+	application.on(
+		"ide.replace",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"replaced":0,"files":0}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let query: string = field_string(request, "query");
+			if query.size() == 0 {
+				return `{"replaced":0,"files":0}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("search");
+			args.push(`--query=${query}`);
+			args.push(`--replace=${field_string(request, "replace")}`);
+			if field_string(request, "regex").size() > 0 {
+				args.push("--regex");
+			}
+			if field_string(request, "case").size() > 0 {
+				args.push("--case");
+			}
+			if field_string(request, "word").size() > 0 {
+				args.push("--word");
+			}
+			let include: string = field_string(request, "include");
+			if include.size() > 0 {
+				args.push(`--include=${include}`);
+			}
+			let exclude: string = field_string(request, "exclude");
+			if exclude.size() > 0 {
+				args.push(`--exclude=${exclude}`);
+			}
+			let output: string = run_peko_capture(args);
+			if output.size() == 0 {
+				return `{"replaced":0,"files":0}`;
+			}
+			return output;
+		},
+	);
+
+	application.on(
+		"ide.list",
+		closure(params: string) => string {
+			let dir_path: string = WORKSPACE_ROOT;
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				let request: json::JsonObject = parsed as json::JsonObject;
+				let path_value: json::JsonValue? = request.get("path");
+				if path_value.is_value() {
+					dir_path = path_value.unwrap() as json::JsonString.get();
+				}
+			}
+
+			let names: Array<string> = fs::list_dir(dir_path);
+			let dir_items: string = "";
+			let file_items: string = "";
+			for name in names {
+				// Hide dotfiles and dot-directories (., .., .git, .DS_Store, etc.).
+				if name.size() > 0 {
+					if name.substring(0, 1) == "." {
+						continue;
+					}
+				}
+				if name == "node_modules" {
+					continue;
+				}
+
+				let full: string = `${dir_path}/${name}`;
+				let is_dir: bool = fs::is_directory(full);
+				let dir_flag: string = "false";
+				if is_dir {
+					dir_flag = "true";
+				}
+				let name_json: string = new json::JsonString(name).to_string();
+				let path_json: string = new json::JsonString(full).to_string();
+				let entry: string = `{"name":${name_json},"path":${path_json},"dir":${dir_flag}}`;
+
+				if is_dir {
+					if dir_items == "" {
+						dir_items = entry;
+					} else {
+						dir_items = `${dir_items},${entry}`;
+					}
+				} else {
+					if file_items == "" {
+						file_items = entry;
+					} else {
+						file_items = `${file_items},${entry}`;
+					}
+				}
+			}
+
+			let entries: string = dir_items;
+			if entries == "" {
+				entries = file_items;
+			} else {
+				if file_items != "" {
+					entries = `${entries},${file_items}`;
+				}
+			}
+			let root_json: string = new json::JsonString(dir_path).to_string();
+			return `{"path":${root_json},"entries":[${entries}]}`;
+		},
+	);
+
+	// ide.read returns a file's text so the editor can open it in a tab.
+	// Params: {path}. Reply: {path, text} or {path, error:true} when unreadable.
+	application.on(
+		"ide.read",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"error":true}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"error":true}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			let content: string? = fs::read_file(path);
+			let path_json: string = new json::JsonString(path).to_string();
+			if !content.is_value() {
+				return `{"path":${path_json},"error":true}`;
+			}
+			let text_json: string = new json::JsonString(content.unwrap()).to_string();
+			return `{"path":${path_json},"text":${text_json}}`;
+		},
+	);
+
+	// ide.readb64 returns a file's bytes as base64 so the editor can render
+	// binary files (images). Params: {path}. Reply: {path, data} or {error}.
+	application.on(
+		"ide.readb64",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"error":true}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"error":true}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			let buffer: fs::Buffer? = fs::read_bytes(path);
+			let path_json: string = new json::JsonString(path).to_string();
+			if !buffer.is_value() {
+				return `{"path":${path_json},"error":true}`;
+			}
+			let bytes: string = buffer.unwrap().to_string();
+			let encoded: string = crypto::to_base64(bytes);
+			let data_json: string = new json::JsonString(encoded).to_string();
+			return `{"path":${path_json},"data":${data_json}}`;
+		},
+	);
+
+	// ide.reveal shows a file or directory in the host file manager. macOS and
+	// Windows select the file; Linux opens its containing folder. Params: {path}.
+	application.on(
+		"ide.reveal",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+
+			let host_os: string = env::os();
+			let program: string = "open";
+			let reveal_args: Array<string> = new Array<string>();
+			if host_os == "windows" {
+				program = "explorer";
+				reveal_args.push(`/select,${to_windows_path(path)}`);
+			} else if host_os == "linux" {
+				program = "xdg-open";
+				reveal_args.push(parent_dir(path));
+			} else {
+				reveal_args.push("-R");
+				reveal_args.push(path);
+			}
+			let opened: process::Process? = process::spawn(program, reveal_args);
+			if opened.is_value() {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.open_build_folder opens the project's build output directory in the
+	// host file manager. Opens the build root (which holds debug/ and release/)
+	// so it fits any build mode.
+	application.on(
+		"ide.open_build_folder",
+		closure(params: string) => string {
+			let target: string = `${WORKSPACE_ROOT}/build`;
+			let host_os: string = env::os();
+			let program: string = "open";
+			if host_os == "windows" {
+				program = "explorer";
+				target = to_windows_path(target);
+			} else if host_os == "linux" {
+				program = "xdg-open";
+			}
+			let open_args: Array<string> = new Array<string>();
+			open_args.push(target);
+			let opened: process::Process? = process::spawn(program, open_args);
+			if opened.is_value() {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.signing.status returns per-platform signing verification (files
+	// present, passwords open them, certificates are the right kind and valid)
+	// by running `peko keys verify --json`. Reply: {reports:[...]}.
+	application.on(
+		"ide.signing.status",
+		closure(params: string) => string {
+			if g_signing.valid {
+				return `{"reports":${g_signing.reports}}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("verify");
+			args.push("--json");
+			let output: string = run_peko_capture(args);
+			if output.size() == 0 {
+				return `{"reports":[]}`;
+			}
+			// The CLI stdout is untrusted. Splice it into the reply only when
+			// it parses as a JSON array, so an extra stdout line degrades to an
+			// empty report list instead of a malformed reply that tears down the
+			// webview.
+			let parsed_reports: json::JsonValue = json::parse(output);
+			if parsed_reports.kind() != "array" {
+				return `{"reports":[]}`;
+			}
+			// Re-serialize the parsed array so the reply is well-formed even
+			// when the CLI stdout had trailing content the parser tolerated.
+			// The parser reads the first value and ignores the rest, so
+			// splicing the raw stdout could produce a malformed reply that
+			// tears down the webview.
+			let reports: string = parsed_reports.to_string();
+			g_signing.reports = reports;
+			g_signing.valid = true;
+			return `{"reports":${reports}}`;
+		},
+	);
+
+	// ide.signing.install writes a dropped key file (base64 in `data`) into the
+	// project and registers it. Params: {platform, role, filename, data, alias?}.
+	// The base64 crosses the bridge as text and is decoded by the CLI so binary
+	// key material stays byte-exact. Reply: {ok}.
+	application.on(
+		"ide.signing.install",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let platform_id: string = field_string(request, "platform");
+			let role: string = field_string(request, "role");
+			let filename: string = field_string(request, "filename");
+			let data: string = field_string(request, "data");
+			let alias: string = field_string(request, "alias");
+			if platform_id.size() == 0 || role.size() == 0 || filename.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("install");
+			args.push(`--platform=${platform_id}`);
+			args.push(`--role=${role}`);
+			args.push(`--filename=${filename}`);
+			if alias.size() > 0 {
+				args.push(`--alias=${alias}`);
+			}
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			child.write_line(data);
+			child.close_input();
+			let code: number = child.wait();
+			if code == 0 {
+				g_signing.valid = false;
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.signing.set_password stores a signing password in the OS keychain.
+	// Params: {platform, role, password}. The password is piped to the CLI over
+	// stdin so it never reaches the process table. Reply: {ok}.
+	application.on(
+		"ide.signing.set_password",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let platform_id: string = field_string(request, "platform");
+			let role: string = field_string(request, "role");
+			let password: string = field_string(request, "password");
+			if platform_id.size() == 0 || role.size() == 0 || password.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("set-password");
+			args.push(`--platform=${platform_id}`);
+			args.push(`--role=${role}`);
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			child.write_line(password);
+			child.close_input();
+			let code: number = child.wait();
+			if code == 0 {
+				g_signing.valid = false;
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.build compiles the project for one platform, streaming the build log
+	// to the panel as ide.build:event output events and a final idle status.
+	// Params: {platform, mode: "release"|"debug"}. Reply: {ok} (returns at once;
+	// the build runs on a background thread).
+	application.on(
+		"ide.build",
+		closure[application](params: string) => string {
+			let platform_id: string = "";
+			let mode: string = "debug";
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				let request: json::JsonObject = parsed as json::JsonObject;
+				platform_id = field_string(request, "platform");
+				let requested_mode: string = field_string(request, "mode");
+				if requested_mode.size() > 0 {
+					mode = requested_mode;
+				}
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("build");
+			if platform_id.size() > 0 {
+				args.push(`--platform=${platform_id}`);
+			}
+			if mode == "release" {
+				args.push("--release");
+			}
+			application.emit("ide.build:event", `{"t":"status","state":"building"}`);
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.build:event",
+					`{"t":"output","stream":"stderr","text":"could not launch peko build"}`,
+				);
+				application.emit("ide.build:event", `{"t":"status","state":"idle"}`);
+				return `{"ok":false}`;
+			}
+			stream_process(application, spawned.unwrap(), "ide.build:event", "peko build");
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.clean wipes the project's incremental build cache (peko build --clean,
+	// which deletes .peko/incremental and exits without building), streaming to
+	// the build output view. Reply: {ok}.
+	application.on(
+		"ide.clean",
+		closure[application](params: string) => string {
+			let args: Array<string> = new Array<string>();
+			args.push("build");
+			args.push("--clean");
+			application.emit(
+				"ide.build:event",
+				`{"t":"output","stream":"stdout","text":"Cleaning incremental build cache..."}`,
+			);
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.build:event",
+					`{"t":"output","stream":"stderr","text":"could not launch peko build --clean"}`,
+				);
+				return `{"ok":false}`;
+			}
+			stream_process(application, spawned.unwrap(), "ide.build:event", "peko build --clean");
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.setup.status reports whether the peko toolchain is installed and
+	// healthy, so the shell can show the first-run setup screen. Runs `peko check`
+	// and reads its exit code. Reply: {healthy, pekoPresent, root}.
+	application.on(
+		"ide.setup.status",
+		closure(params: string) => string {
+			let root: string = peko_root();
+			let root_json: string = new json::JsonString(root).to_string();
+			let peko_path: string = resolve_peko();
+			if peko_path.size() == 0 {
+				return `{"healthy":false,"pekoPresent":false,"root":${root_json}}`;
+			}
+			let dir: string = root;
+			if dir.size() == 0 {
+				dir = ".";
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("check");
+			let spawned: process::Process? = process::spawn_in(peko_path, args, dir);
+			if !spawned.is_value() {
+				return `{"healthy":false,"pekoPresent":false,"root":${root_json}}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			let line: string? = child.read_line();
+			while line.is_value() {
+				line = child.read_line();
+			}
+			let errline: string? = child.read_error_line();
+			while errline.is_value() {
+				errline = child.read_error_line();
+			}
+			let code: number = child.wait();
+			let healthy: string = "false";
+			if code == 0 {
+				healthy = "true";
+			}
+			return `{"healthy":${healthy},"pekoPresent":true,"root":${root_json}}`;
+		},
+	);
+
+	// ide.setup.run installs or updates the toolchain by streaming `peko setup
+	// --json`. Progress events arrive as ide.setup:event; the final exit code is
+	// ide.setup:done. Params: {windows}. Reply: {ok} (returns at once; the setup
+	// runs on a background thread).
+	application.on(
+		"ide.setup.run",
+		closure[application](params: string) => string {
+			let windows: bool = false;
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				windows = opt_bool(parsed as json::JsonObject, "windows", false);
+			}
+			let dir: string = env::get("HOME");
+			if dir.size() == 0 {
+				dir = ".";
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("setup");
+			args.push("--json");
+			if windows {
+				args.push("--windows");
+				args.push("--accept-microsoft-license");
+			}
+			// Hand the whole flow (download the CLI, launch setup, stream output)
+			// to a background thread so this handler returns at once and progress
+			// events reach the webview live.
+			run_setup_flow(application, args, dir);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.run.start launches the project's dev loop (`peko run --ide`), which
+	// hosts the app window and streams dev events over stdout. Any existing run
+	// is stopped gracefully first so its window closes. Params: {mode}.
+	application.on(
+		"ide.run.start",
+		closure[application](params: string) => string {
+			stop_run();
+			let mode: string = "debug";
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				let requested_mode: string = field_string(parsed as json::JsonObject, "mode");
+				if requested_mode.size() > 0 {
+					mode = requested_mode;
+				}
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("run");
+			args.push("--ide");
+			if mode == "release" {
+				args.push("--release");
+			}
+			application.emit("ide.run:event", `{"t":"status","state":"running"}`);
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.run:event",
+					`{"t":"output","stream":"stderr","text":"could not launch peko run"}`,
+				);
+				application.emit("ide.run:event", `{"t":"status","state":"idle"}`);
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			g_run.child = child;
+			stream_run(application, child);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.run.stop tears the dev loop down gracefully so its app window and dev
+	// server close. The child's exit reports idle through stream_run. Reply:
+	// {ok}.
+	application.on(
+		"ide.run.stop",
+		closure[application](params: string) => string {
+			if g_run.child.is_value() {
+				application.emit("ide.run:event", `{"t":"status","state":"stopping"}`);
+				stop_run();
+				application.emit(
+					"ide.run:event",
+					`{"t":"output","stream":"stdout","text":"stopping the dev loop"}`,
+				);
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.run.restart relaunches the app window in place, keeping the dev server
+	// and watcher. The current window closes and reopens. Reply: {ok}.
+	application.on(
+		"ide.run.restart",
+		closure(params: string) => string {
+			if g_run.child.is_value() {
+				g_run.child.unwrap().write_line(`{"t":"restart"}`);
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.run.eval evaluates an expression in the running page. The result comes
+	// back as a console event through the dev-event stream. Params: {code}.
+	application.on(
+		"ide.run.eval",
+		closure(params: string) => string {
+			if !g_run.child.is_value() {
+				return `{"ok":false}`;
+			}
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let code: string = field_string(parsed as json::JsonObject, "code");
+			let code_json: string = new json::JsonString(code).to_string();
+			g_run.child.unwrap().write_line(`{"t":"eval","code":${code_json}}`);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.run.complete asks the running page for the property names on a base
+	// expression, for console completion. The names come back as a complete
+	// event through the dev-event stream. Params: {code} (empty lists globals).
+	application.on(
+		"ide.run.complete",
+		closure(params: string) => string {
+			if !g_run.child.is_value() {
+				return `{"ok":false}`;
+			}
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let code: string = field_string(parsed as json::JsonObject, "code");
+			let code_json: string = new json::JsonString(code).to_string();
+			g_run.child.unwrap().write_line(`{"t":"complete","code":${code_json}}`);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.run.page asks the running page for a snapshot (route, url, title,
+	// metrics, source). The snapshot comes back as a page event through the
+	// dev-event stream. Reply: {ok}.
+	application.on(
+		"ide.run.page",
+		closure(params: string) => string {
+			if !g_run.child.is_value() {
+				return `{"ok":false}`;
+			}
+			g_run.child.unwrap().write_line(`{"t":"page"}`);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.run.resource fetches one loaded resource's text body (by url) from the
+	// running page, for the source viewer. Comes back as a resource event.
+	// Params: {url}. Reply: {ok}.
+	application.on(
+		"ide.run.resource",
+		closure(params: string) => string {
+			if !g_run.child.is_value() {
+				return `{"ok":false}`;
+			}
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let url: string = field_string(parsed as json::JsonObject, "url");
+			let url_json: string = new json::JsonString(url).to_string();
+			g_run.child.unwrap().write_line(`{"t":"resource","url":${url_json}}`);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.mkdir creates a directory. Params: {path}. Reply: {ok}.
+	application.on(
+		"ide.mkdir",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			if fs::make_dir(path) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.create creates an empty file. Params: {path}. Reply: {ok}.
+	application.on(
+		"ide.create",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			if fs::create(path) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.rename moves a file or directory. Params: {from, to}. Reply: {ok}.
+	application.on(
+		"ide.rename",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let from_value: json::JsonValue? = request.get("from");
+			let to_value: json::JsonValue? = request.get("to");
+			if !from_value.is_value() {
+				return `{"ok":false}`;
+			}
+			if !to_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let source_path: string = from_value.unwrap() as json::JsonString.get();
+			let dest_path: string = to_value.unwrap() as json::JsonString.get();
+			if fs::move(source_path, dest_path) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.delete removes a file or directory (recursively). Params: {path}.
+	application.on(
+		"ide.delete",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+			if fs::remove(path) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.trash moves a file or directory to the user Trash (recoverable), unlike
+	// ide.delete which removes it permanently. Params: {path}. Reply: {ok}.
+	application.on(
+		"ide.trash",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let path_value: json::JsonValue? = request.get("path");
+			if !path_value.is_value() {
+				return `{"ok":false}`;
+			}
+			let path: string = path_value.unwrap() as json::JsonString.get();
+
+			let home: string = env::get("HOME");
+			if home.size() == 0 {
+				return `{"ok":false}`;
+			}
+			// The base name is the segment after the last path separator.
+			let base: string = path;
+			let index: number = 0;
+			let cut: number = -1;
+			while index < path.size() {
+				if path.substring(index, index + 1) == "/" {
+					cut = index;
+				}
+				index = index + 1;
+			}
+			if cut >= 0 {
+				base = path.substring(cut + 1, path.size());
+			}
+
+			let dest: string = `${home}/.Trash/${base}`;
+			if fs::move(path, dest) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// Poll open files for external changes and push ide.fs.change events.
+	start_file_watcher(application);
+}
+
+/// Build the application menu bar. Standard editing commands use native roles
+/// so the OS runs them on the focused editor; the rest emit a menu event the
+/// web UI maps to an editor action.
+fn build_ide_menu() => ui::menu::Menu {
+	let bar: ui::menu::Menu = new ui::menu::Menu();
+
+	bar.app().item("About Peko Studio", "app.about", "");
+
+	let file: ui::menu::Submenu = bar.submenu("File");
+	file.item("New File", "file.new", "CmdOrCtrl+N");
+	file.item("Project Launcher...", "file.launcher", "CmdOrCtrl+Shift+O");
+	file.item("Open Folder...", "file.openFolder", "CmdOrCtrl+O");
+	file.separator();
+	file.item("Save", "file.save", "CmdOrCtrl+S");
+	file.item("Save As...", "file.saveAs", "CmdOrCtrl+Shift+S");
+	file.separator();
+	file.item("Project Settings...", "file.settings", "CmdOrCtrl+,");
+	file.item("Manage Packages...", "file.packages", "");
+	file.item("App Icon...", "file.icon", "");
+	file.separator();
+	let reveal_label: string = "Reveal in Finder";
+	let menu_os: string = env::os();
+	if menu_os == "windows" {
+		reveal_label = "Show in Explorer";
+	} else if menu_os == "linux" {
+		reveal_label = "Open Containing Folder";
+	}
+	file.item(reveal_label, "file.reveal", "");
+	file.separator();
+	file.item_role("Close Window", ui::menu::MenuRole::Close);
+
+	let edit: ui::menu::Submenu = bar.submenu("Edit");
+	edit.item_role("Undo", ui::menu::MenuRole::Undo);
+	edit.item_role("Redo", ui::menu::MenuRole::Redo);
+	edit.separator();
+	edit.item_role("Cut", ui::menu::MenuRole::Cut);
+	edit.item_role("Copy", ui::menu::MenuRole::Copy);
+	edit.item_role("Paste", ui::menu::MenuRole::Paste);
+	edit.item_role("Select All", ui::menu::MenuRole::SelectAll);
+	edit.separator();
+	edit.item("Find", "edit.find", "CmdOrCtrl+F");
+	edit.item("Replace", "edit.replace", "CmdOrCtrl+Alt+F");
+	edit.item("Format Document", "edit.format", "Shift+Alt+F");
+
+	let view: ui::menu::Submenu = bar.submenu("View");
+	view.item("Command Palette", "view.commands", "CmdOrCtrl+Shift+P");
+	view.separator();
+	view.item("Toggle Word Wrap", "view.wordwrap", "Alt+Z");
+
+	let go: ui::menu::Submenu = bar.submenu("Go");
+	go.item("Go to File...", "go.file", "CmdOrCtrl+P");
+	go.item("Go to Definition", "go.definition", "F12");
+	go.item("Go to Line...", "go.line", "CmdOrCtrl+G");
+
+	let help: ui::menu::Submenu = bar.submenu("Help");
+	help.item("Documentation", "help.docs", "");
+
+	return bar;
+}
+
+/// The final path segment of `path`.
+fn basename(path: string) => string {
+	let cut: number = -1;
+	let index: number = 0;
+	while index < path.size() {
+		if path.substring(index, index + 1) == "/" {
+			cut = index;
+		}
+		index = index + 1;
+	}
+	if cut < 0 {
+		return path;
+	}
+	return path.substring(cut + 1, path.size());
+}
+
+/// On Linux, install a desktop entry and icon into the user's data directory so
+/// the dock shows the app name and icon. A bare AppImage is not on the system
+/// desktop search path, so the desktop environment otherwise falls back to the
+/// raw window class and a generic icon. Runs only when launched from an AppImage
+/// (APPIMAGE names the image file) and is safe to repeat every launch.
+fn integrate_desktop() {
+	let appimage: string = env::get("APPIMAGE");
+	if appimage.size() == 0 {
+		return;
+	}
+	let home: string = env::get("HOME");
+	if home.size() == 0 {
+		return;
+	}
+	// The window's app id equals the binary name, since GTK derives WM_CLASS and
+	// the Wayland app id from it. The desktop entry basename and StartupWMClass
+	// must match it for the environment to associate the window with the entry.
+	let app_id: string = basename(env::self_exe());
+	if app_id.size() == 0 {
+		return;
+	}
+
+	fs::make_dir(`${home}/.local`);
+	fs::make_dir(`${home}/.local/share`);
+	fs::make_dir(`${home}/.local/share/applications`);
+	fs::make_dir(`${home}/.local/share/icons`);
+	fs::make_dir(`${home}/.local/share/icons/hicolor`);
+	fs::make_dir(`${home}/.local/share/icons/hicolor/256x256`);
+	fs::make_dir(`${home}/.local/share/icons/hicolor/256x256/apps`);
+
+	// Copy the bundled icon out of the mounted AppImage into the user icon theme
+	// under the app id. .DirIcon at the mount root is the app icon and is always
+	// present. The desktop entry points Icon at the copied file by ABSOLUTE PATH
+	// rather than by theme name: a name needs the icon-theme cache rebuilt before
+	// it resolves (so the dock would show the name but no icon until the next
+	// login), while an absolute path loads immediately.
+	let icon_dst: string = `${home}/.local/share/icons/hicolor/256x256/apps/${app_id}.png`;
+	let appdir: string = env::get("APPDIR");
+	if appdir.size() > 0 {
+		fs::copy(`${appdir}/.DirIcon`, icon_dst);
+	}
+
+	let entry: string = `[Desktop Entry]\nType=Application\nName=Peko Studio\nExec="${appimage}" %U\nIcon=${icon_dst}\nStartupWMClass=${app_id}\nCategories=Development;\nTerminal=false\n`;
+	fs::write_file(`${home}/.local/share/applications/${app_id}.desktop`, entry);
+}
+
+fn on_start() {
+	// With no project set this window is the launcher: a small window that opens
+	// or creates a project, then starts the editor in its own window. The editor
+	// mode spawns the language server and opens the project.
+	let launcher_mode: bool = WORKSPACE_ROOT.size() == 0;
+
+	// Spawn the language server before the webview toolkit initializes, so the
+	// fork runs in a clean process state. The launcher needs no language server.
+	let lsp: process::Process? = None;
+	if !launcher_mode {
+		lsp = spawn_lsp();
+	}
+
+	let application = ui::app::from_bundle();
+
+	// Each launch is its own window, so the launcher and several projects can be
+	// open at once.
+	application.allow_multiple_instances();
+
+	// Register the desktop entry on Linux so the dock shows the app name + icon.
+	if env::os() == "linux" {
+		integrate_desktop();
+	}
+
+	// A frameless, transparent window: the web UI draws its own titlebar and
+	// composites over the layer behind the window.
+	let view: ui::webview::WebView = application.webview();
+	view.set_decorations(false);
+	view.set_transparent(true);
+	// Hide the native macOS traffic lights so the web titlebar draws its own,
+	// which it can position and center precisely.
+	view.set_custom_controls(true);
+
+	// The launcher is a small, fixed dialog rather than the full editor window.
+	if launcher_mode {
+		view.set_size(720, 460);
+	}
+
+	// The editor window installs a menu; the launcher is a plain dialog with
+	// none. Windows renders a native menu inside a frameless window's client
+	// area, where it cannot match the dark theme, so the app draws its own HTML
+	// menu there instead (use_html_menu suppresses the native bar and the client
+	// SDK renders peko.menu). macOS and Linux keep their native menu bar.
+	if !launcher_mode {
+		if env::os() == "windows" {
+			application.use_html_menu();
+		} else {
+			application.set_menu(build_ide_menu());
+		}
+	}
+
+	// Start the language-server relay and register the workspace handlers.
+	let lsp_port: number = 0;
+	if lsp.is_value() {
+		lsp_port = start_lsp_relay(lsp.unwrap());
+	}
+	register_ide_handlers(application, lsp_port);
+
+	application.run();
+
+	// The window closed. Stop the language server so it does not outlive the
+	// app as an orphaned process.
+	if lsp.is_value() {
+		lsp.unwrap().kill();
+	}
+}
