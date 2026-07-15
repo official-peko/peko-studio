@@ -222,9 +222,20 @@ export function addPackage(opts: { name: string; version?: string; path?: string
   })
 }
 
-/// Remove a dependency (peko remove).
-export function removePackage(name: string) {
-  return packageCommand('ide.packages.remove', { name })
+/// Remove a dependency (peko remove). `global` targets the shared global manifest.
+export function removePackage(name: string, global = false) {
+  return packageCommand('ide.packages.remove', { name, global: global ? 'true' : '' })
+}
+
+/// The shared global library root, whose peko.toml lists globally-installed
+/// packages. Empty when Peko is not installed.
+export async function globalRoot(): Promise<string> {
+  try {
+    const result = (await peko.invoke('ide.packages.global_root', {})) as { root?: string }
+    return result.root ?? ''
+  } catch {
+    return ''
+  }
 }
 
 /// Every .peko source file under the project, so the editor can open them all to
@@ -372,6 +383,16 @@ export async function openProject(path: string): Promise<string | null> {
   }
 }
 
+/// Open the Setup window as a fresh app instance (spawned like the launcher).
+/// `view` opens straight to one action (update | resetup | packages | uninstall).
+export async function openSetupWindow(view?: string): Promise<void> {
+  try {
+    await peko.invoke('ide.open_setup', { view: view ?? '' })
+  } catch {
+    // No native bridge; nothing to open.
+  }
+}
+
 /// Open the project launcher in a new window (a fresh instance with no project).
 /// The caller closes its own window to replace it. Resolves true on success.
 export async function openLauncherWindow(): Promise<boolean> {
@@ -398,6 +419,8 @@ export async function pickFolder(): Promise<string> {
 export interface NewProjectOptions {
   name: string
   dir?: string
+  /** Project kind: `ui`, `cli`, or `package` (a library). Falls back to `ui`. */
+  type?: 'ui' | 'cli' | 'package'
   ui?: boolean
   framework?: string
 }

@@ -26,6 +26,9 @@ import std::crypto;
 // project opens.
 let WORKSPACE_ROOT: string = resolve_workspace_root();
 let ENTRY_FILE: string = project_entry(WORKSPACE_ROOT);
+// When set (via PEKO_IDE_SETUP), this window is a Setup window rather than the
+// launcher or editor; the value is the action to open ("menu" | "update" | ...).
+let SETUP_VIEW: string = env::get("PEKO_IDE_SETUP");
 
 /// Holds the running `peko run` dev-loop process so ide.run.stop can terminate
 /// it. A single-field shared object gives cross-handler mutable state.
@@ -1575,6 +1578,7 @@ fn open_project_window(path: string) => bool {
 		return false;
 	}
 	add_recent(path);
+	env::set("PEKO_IDE_SETUP", "");
 	env::set("PEKO_IDE_PROJECT", path);
 	let args: Array<string> = new Array<string>();
 	let started: process::Process? = process::spawn(exe, args);
@@ -1588,26 +1592,45 @@ fn open_launcher_window() => bool {
 	if exe.size() == 0 {
 		return false;
 	}
+	env::set("PEKO_IDE_SETUP", "");
 	env::set("PEKO_IDE_PROJECT", "");
 	let args: Array<string> = new Array<string>();
 	let started: process::Process? = process::spawn(exe, args);
 	return started.is_value();
 }
 
+/// Open the Setup window as a new instance of this app (like the launcher), with
+/// PEKO_IDE_SETUP naming the action. Clears the flag afterward so later windows
+/// this process spawns are not Setup windows.
+fn open_setup_window(view: string) => bool {
+	let exe: string = env::self_exe();
+	if exe.size() == 0 {
+		return false;
+	}
+	env::set("PEKO_IDE_SETUP", view);
+	env::set("PEKO_IDE_PROJECT", "");
+	let args: Array<string> = new Array<string>();
+	let started: process::Process? = process::spawn(exe, args);
+	env::set("PEKO_IDE_SETUP", "");
+	return started.is_value();
+}
+
 /// Scaffold a new project with `peko project new` (non-interactive) under dir,
-/// and return its root path, or empty on failure.
-fn create_project(dir: string, name: string, ui_project: bool, framework: string) => string {
+/// and return its root path, or empty on failure. `project_type` is one of
+/// `ui`, `cli`, or `package`.
+fn create_project(dir: string, name: string, project_type: string, framework: string) => string {
 	let args: Array<string> = new Array<string>();
 	args.push("project");
 	args.push("new");
-	args.push(`--name=${name}`);
-	args.push(`--dir=${dir}`);
-	if ui_project {
-		if framework.size() > 0 {
-			args.push(`--framework=${framework}`);
-		}
-	} else {
-		args.push("--no-ui");
+	args.push("--name");
+	args.push(name);
+	args.push("--dir");
+	args.push(dir);
+	args.push("--type");
+	args.push(project_type);
+	if project_type == "ui" && framework.size() > 0 {
+		args.push("--framework");
+		args.push(framework);
 	}
 	let spawned: process::Process? = spawn_peko_in(args, dir);
 	if !spawned.is_value() {
@@ -1660,6 +1683,10 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 	application.on(
 		"ide.entry",
 		closure[lsp_port](params: string) => string {
+			// A Setup window: neither launcher nor editor. Carries the action to open.
+			if SETUP_VIEW.size() > 0 {
+				return `{"setup":${new json::JsonString(SETUP_VIEW).to_string()}}`;
+			}
 			// No project set: this window is the launcher, not the editor.
 			if WORKSPACE_ROOT.size() == 0 {
 				return `{"launcher":true}`;
@@ -1729,7 +1756,8 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 	);
 
 	// ide.projects.new scaffolds a project and opens it. Params: {name, dir,
-	// ui, framework}. dir defaults to the user's home. Reply: {ok, path?, error?}.
+	// type, framework}. type is `ui` | `cli` | `package` (falls back to the old
+	// `ui` bool). dir defaults to the user's home. Reply: {ok, path?, error?}.
 	application.on(
 		"ide.projects.new",
 		closure(params: string) => string {
@@ -1741,14 +1769,21 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let name: string = opt_string(object, "name");
 			let dir: string = opt_string(object, "dir");
 			let framework: string = opt_string(object, "framework");
-			let ui_project: bool = opt_bool(object, "ui", true);
+			// Prefer the explicit `type`; fall back to the legacy `ui` bool.
+			let project_type: string = opt_string(object, "type");
+			if project_type.size() == 0 {
+				project_type = "ui";
+				if !opt_bool(object, "ui", true) {
+					project_type = "cli";
+				}
+			}
 			if name.size() == 0 {
 				return `{"ok":false,"error":"name required"}`;
 			}
 			if dir.size() == 0 {
 				dir = home_dir();
 			}
-			let created: string = create_project(dir, name, ui_project, framework);
+			let created: string = create_project(dir, name, project_type, framework);
 			if created.size() == 0 {
 				return `{"ok":false,"error":"could not create project"}`;
 			}
@@ -1806,10 +1841,44 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			if name.size() == 0 {
 				return `{"ok":false,"output":"package name required"}`;
 			}
+			let scope: string = opt_string(object, "global");
 			let args: Array<string> = new Array<string>();
 			args.push("remove");
 			args.push(name);
+			if scope == "true" {
+				args.push("--global");
+			}
 			return run_peko_result(args);
+		},
+	);
+
+	// ide.packages.global_root returns the shared global library root, whose
+	// peko.toml lists the globally-installed packages. Reply: {root}.
+	application.on(
+		"ide.packages.global_root",
+		closure(params: string) => string {
+			let root: string = peko_root();
+			if root.size() == 0 {
+				return `{"root":""}`;
+			}
+			let dir: string = `${root}/global`;
+			return `{"root":${new json::JsonString(dir).to_string()}}`;
+		},
+	);
+
+	// ide.uninstall deletes the whole Peko installation (~/.Peko): the CLI, SDK,
+	// toolchains, and global packages. Reply: {ok} or {ok:false, output}.
+	application.on(
+		"ide.uninstall",
+		closure(params: string) => string {
+			let root: string = peko_root();
+			if root.size() == 0 {
+				return `{"ok":false,"output":"Peko is not installed"}`;
+			}
+			if fs::remove(root) {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false,"output":"could not delete the Peko installation"}`;
 		},
 	);
 
@@ -1891,6 +1960,26 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 		"ide.open_launcher",
 		closure(params: string) => string {
 			if open_launcher_window() {
+				return `{"ok":true}`;
+			}
+			return `{"ok":false}`;
+		},
+	);
+
+	// ide.open_setup opens the Setup window as a new app instance. Params: {view?}
+	// (menu | update | resetup | packages | uninstall). Reply: {ok}.
+	application.on(
+		"ide.open_setup",
+		closure(params: string) => string {
+			let view: string = "menu";
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				let requested: string = opt_string(parsed as json::JsonObject, "view");
+				if requested.size() > 0 {
+					view = requested;
+				}
+			}
+			if open_setup_window(view) {
 				return `{"ok":true}`;
 			}
 			return `{"ok":false}`;
@@ -2894,9 +2983,11 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 		"ide.setup.run",
 		closure[application](params: string) => string {
 			let windows: bool = false;
+			let force: bool = false;
 			let parsed: json::JsonValue = json::parse(params);
 			if parsed.kind() == "object" {
 				windows = opt_bool(parsed as json::JsonObject, "windows", false);
+				force = opt_bool(parsed as json::JsonObject, "force", false);
 			}
 			let dir: string = env::get("HOME");
 			if dir.size() == 0 {
@@ -2905,6 +2996,9 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let args: Array<string> = new Array<string>();
 			args.push("setup");
 			args.push("--json");
+			if force {
+				args.push("--force");
+			}
 			if windows {
 				args.push("--windows");
 				args.push("--accept-microsoft-license");
@@ -2914,6 +3008,53 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			// events reach the webview live.
 			run_setup_flow(application, args, dir);
 			return `{"ok":true}`;
+		},
+	);
+
+	// ide.update.check reports whether a newer peko CLI/SDK release is available
+	// by running `peko setup --check --json` and returning its `check` event,
+	// which carries {updateAvailable, installed, latest}. Reply: that JSON, or
+	// {"updateAvailable":false} when it cannot be determined (e.g. offline).
+	application.on(
+		"ide.update.check",
+		closure(params: string) => string {
+			let dir: string = peko_root();
+			if dir.size() == 0 {
+				dir = env::get("HOME");
+			}
+			if dir.size() == 0 {
+				dir = ".";
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("setup");
+			args.push("--check");
+			args.push("--json");
+			let spawned: process::Process? = spawn_peko_in(args, dir);
+			if !spawned.is_value() {
+				return `{"updateAvailable":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			let result: string = "";
+			let line: string? = child.read_line();
+			while line.is_value() {
+				let text: string = line.unwrap();
+				let value: json::JsonValue = json::parse(text);
+				if value.kind() == "object" {
+					if opt_string(value as json::JsonObject, "type") == "check" {
+						result = text;
+					}
+				}
+				line = child.read_line();
+			}
+			let errline: string? = child.read_error_line();
+			while errline.is_value() {
+				errline = child.read_error_line();
+			}
+			child.wait();
+			if result.size() > 0 {
+				return result;
+			}
+			return `{"updateAvailable":false}`;
 		},
 	);
 
@@ -3248,6 +3389,13 @@ fn build_ide_menu() => ui::menu::Menu {
 	go.item("Go to File...", "go.file", "CmdOrCtrl+P");
 	go.item("Go to Definition", "go.definition", "F12");
 	go.item("Go to Line...", "go.line", "CmdOrCtrl+G");
+
+	let setup_menu: ui::menu::Submenu = bar.submenu("Setup");
+	setup_menu.item("Update Peko CLI...", "setup.updateCli", "");
+	setup_menu.item("Re-setup SDK...", "setup.resetupSdk", "");
+	setup_menu.item("Global Packages...", "setup.globalPackages", "");
+	setup_menu.separator();
+	setup_menu.item("Uninstall Peko...", "setup.uninstall", "");
 
 	let help: ui::menu::Submenu = bar.submenu("Help");
 	help.item("Documentation", "help.docs", "");

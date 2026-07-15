@@ -5,27 +5,48 @@ import './index.css'
 import App from './App'
 import { Launcher } from './ide/Launcher'
 import { SetupScreen } from './setup/SetupScreen'
-import { isLauncherWindow } from './ide/workspace'
+import { SetupWindow } from './setup/SetupWindow'
 
-// The first window resolves in two stages. First the toolchain is checked: an
-// unhealthy or missing install shows the setup screen ahead of everything else,
-// so the environment is installed before a project can be opened. Once the
-// toolchain is healthy the window resolves to the launcher (no project set) or
-// the editor. A /launcher pop-up opened from a running editor skips the check,
-// since a running editor already implies a healthy install.
+type WindowKind =
+  | { kind: 'launcher' }
+  | { kind: 'editor' }
+  | { kind: 'setup'; view: string }
+
+// The window kind comes from the native side (ide.entry): a Setup window is a
+// fresh app instance spawned with PEKO_IDE_SETUP, like the launcher is spawned
+// with no project. A Setup window renders immediately — it exists to install or
+// repair the toolchain, so it is not gated on a healthy install. The launcher
+// and editor are gated: an unhealthy or missing install shows the first-run
+// setup screen ahead of them. A /launcher pop-up skips the check outright.
 function Root() {
   const routeLauncher = window.location.pathname.replace(/\/+$/, '') === '/launcher'
-  const [setup, setSetup] = useState<{ needed: boolean; pekoPresent: boolean } | null>(
+  const [win, setWin] = useState<WindowKind | null>(routeLauncher ? { kind: 'launcher' } : null)
+  const [toolchain, setToolchain] = useState<{ needed: boolean; pekoPresent: boolean } | null>(
     routeLauncher ? { needed: false, pekoPresent: true } : null,
   )
-  const [mode, setMode] = useState<'loading' | 'launcher' | 'editor'>(
-    routeLauncher ? 'launcher' : 'loading',
-  )
 
-  // Check the toolchain before anything else. No bridge (browser dev) or an
-  // error leaves the app in place with a healthy assumption.
+  // Resolve which kind of window this is.
   useEffect(() => {
     if (routeLauncher) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const entry = (await peko.invoke('ide.entry', {})) as { launcher?: boolean; setup?: string }
+        if (cancelled) return
+        if (typeof entry.setup === 'string') setWin({ kind: 'setup', view: entry.setup })
+        else setWin({ kind: entry.launcher ? 'launcher' : 'editor' })
+      } catch {
+        if (!cancelled) setWin({ kind: 'editor' })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [routeLauncher])
+
+  // Gate the launcher/editor on a healthy toolchain (a Setup window skips this).
+  useEffect(() => {
+    if (routeLauncher || !win || win.kind === 'setup') return
     let cancelled = false
     void (async () => {
       try {
@@ -34,35 +55,22 @@ function Root() {
           pekoPresent?: boolean
         }
         if (cancelled) return
-        setSetup({ needed: !status.healthy, pekoPresent: status.pekoPresent !== false })
+        setToolchain({ needed: !status.healthy, pekoPresent: status.pekoPresent !== false })
       } catch {
-        if (!cancelled) setSetup({ needed: false, pekoPresent: true })
+        if (!cancelled) setToolchain({ needed: false, pekoPresent: true })
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [routeLauncher])
+  }, [routeLauncher, win])
 
-  // Resolve launcher vs editor only once the toolchain is known and healthy, so
-  // the project selector never appears ahead of a needed install.
-  useEffect(() => {
-    if (routeLauncher || mode !== 'loading') return
-    if (!setup || setup.needed) return
-    let cancelled = false
-    void isLauncherWindow().then((launcher) => {
-      if (!cancelled) setMode(launcher ? 'launcher' : 'editor')
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [setup, routeLauncher, mode])
-
-  if (setup?.needed) {
-    return <SetupScreen pekoPresent={setup.pekoPresent} onDone={() => window.location.reload()} />
+  if (win?.kind === 'setup') return <SetupWindow initialView={win.view} />
+  if (toolchain?.needed) {
+    return <SetupScreen pekoPresent={toolchain.pekoPresent} onDone={() => window.location.reload()} />
   }
-  if (!setup || mode === 'loading') return <div className="launcher-splash" />
-  return mode === 'launcher' ? <Launcher /> : <App />
+  if (!win || !toolchain) return <div className="launcher-splash" />
+  return win.kind === 'launcher' ? <Launcher /> : <App />
 }
 
 createRoot(document.getElementById('root')!).render(

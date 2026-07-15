@@ -18,6 +18,7 @@ import {
   loadManifest,
   openLauncherWindow,
   openProject,
+  openSetupWindow,
   pickFolder,
   setWatchedFiles,
   gitStatus,
@@ -52,6 +53,8 @@ export default function App() {
   const [showPackages, setShowPackages] = useState(false)
   const [showIcon, setShowIcon] = useState(false)
   const [showAgent, setShowAgent] = useState(false)
+  // A newer Peko CLI/SDK release, when one is available, and the update overlay.
+  const [update, setUpdate] = useState<{ latest: string | null } | null>(null)
 
   // A request to refresh an open file's model from disk after an external write.
   const [diagnostics, setDiagnostics] = useState<FileDiagnostic[]>([])
@@ -156,6 +159,28 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Check once for a newer Peko CLI/SDK release, to offer an in-IDE update. Runs
+  // `peko setup --check` via the native bridge; silent when offline or current.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = (await peko.invoke('ide.update.check', {})) as {
+          updateAvailable?: boolean
+          latest?: { peko?: string | null }
+        }
+        if (!cancelled && res?.updateAvailable) {
+          setUpdate({ latest: res.latest?.peko ?? null })
+        }
+      } catch {
+        // Offline or no bridge; skip the update prompt.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // Load the persisted theme from the native prefs store once the bridge is
   // ready. localStorage is only a fast first-paint default; it does not survive
   // restarts because the asset-server origin changes each launch.
@@ -198,6 +223,14 @@ export default function App() {
         setShowPackages(true)
       } else if (id === 'file.icon') {
         setShowIcon(true)
+      } else if (id === 'setup.updateCli') {
+        void openSetupWindow('update')
+      } else if (id === 'setup.resetupSdk') {
+        void openSetupWindow('resetup')
+      } else if (id === 'setup.globalPackages') {
+        void openSetupWindow('packages')
+      } else if (id === 'setup.uninstall') {
+        void openSetupWindow('uninstall')
       }
     })
     return off
@@ -249,6 +282,16 @@ export default function App() {
           items: [
             { label: 'Toggle Dev Tools', onClick: () => setPanelCollapsed((v) => !v) },
             { label: 'Toggle Word Wrap', action: 'view.wordwrap', accelerator: 'Alt+Z' },
+          ],
+        },
+        {
+          label: 'Setup',
+          items: [
+            { label: 'Update Peko CLI...', action: 'setup.updateCli' },
+            { label: 'Re-setup SDK...', action: 'setup.resetupSdk' },
+            { label: 'Global Packages...', action: 'setup.globalPackages' },
+            { separator: true },
+            { label: 'Uninstall Peko...', action: 'setup.uninstall' },
           ],
         },
         {
@@ -524,6 +567,15 @@ export default function App() {
           >
             ⚙
           </button>
+          {update && (
+            <button
+              className="status-toggle status-update"
+              title={`A new Peko version${update.latest ? ` (${update.latest})` : ''} is available — click to update`}
+              onClick={() => void openSetupWindow('update')}
+            >
+              Update ●
+            </button>
+          )}
           <ThemePicker value={theme} onChange={setTheme} />
           <AccountChip />
         </footer>

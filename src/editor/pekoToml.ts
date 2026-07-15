@@ -36,7 +36,20 @@ const SCHEMA: Record<string, TableSpec> = {
   ui: {
     detail: 'UI form and window',
     keys: {
-      framework: { type: 'string', values: ['native', 'static', 'server'] },
+      framework: {
+        type: 'string',
+        values: [
+          'native',
+          'static',
+          'server',
+          'next',
+          'nuxt',
+          'sveltekit',
+          'remix',
+          'astro',
+          'angular',
+        ],
+      },
       icon: { type: 'string', detail: 'Square PNG icon path' },
       scheme: { type: 'string', detail: 'Deep-link URL scheme' },
       width: { type: 'number', detail: 'Initial window width' },

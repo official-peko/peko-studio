@@ -12,6 +12,7 @@ import {
   recentProjects,
   openProject,
   newProject,
+  openSetupWindow,
   pickFolder,
   type RecentProject,
 } from './workspace'
@@ -22,20 +23,33 @@ import svelteLogo from './logos/svelte.svg'
 import solidLogo from './logos/solid.svg'
 import preactLogo from './logos/preact.svg'
 import jsLogo from './logos/javascript.svg'
+import nextLogo from './logos/next.svg'
+import nuxtLogo from './logos/nuxt.svg'
+import remixLogo from './logos/remix.svg'
+import astroLogo from './logos/astro.svg'
+import angularLogo from './logos/angular.svg'
 
 type View = 'home' | 'configure' | 'open'
 
-// create-vite templates offered for a new UI project, plus a command-line
-// (no UI) option. Each carries its framework's logo; the command-line option
-// has no framework logo and shows a terminal glyph.
+// Templates offered for a new project. `server` templates are SSR frameworks
+// deployed to Peko hosting; the rest are static (SSG) apps shown in a native
+// window, plus a command-line (no UI) option. Each carries a framework logo;
+// the command-line option has no logo and shows a terminal glyph.
 const TEMPLATES = [
-  { label: 'React', framework: 'react-ts', ui: true, logo: reactLogo },
-  { label: 'Vue', framework: 'vue-ts', ui: true, logo: vueLogo },
-  { label: 'Svelte', framework: 'svelte-ts', ui: true, logo: svelteLogo },
-  { label: 'Solid', framework: 'solid', ui: true, logo: solidLogo },
-  { label: 'Preact', framework: 'preact', ui: true, logo: preactLogo },
-  { label: 'Vanilla', framework: 'vanilla', ui: true, logo: jsLogo },
-  { label: 'Command Line', framework: '', ui: false, logo: null },
+  { label: 'React', framework: 'react-ts', ui: true, server: false, logo: reactLogo },
+  { label: 'Vue', framework: 'vue-ts', ui: true, server: false, logo: vueLogo },
+  { label: 'Svelte', framework: 'svelte-ts', ui: true, server: false, logo: svelteLogo },
+  { label: 'Solid', framework: 'solid', ui: true, server: false, logo: solidLogo },
+  { label: 'Preact', framework: 'preact', ui: true, server: false, logo: preactLogo },
+  { label: 'Vanilla', framework: 'vanilla', ui: true, server: false, logo: jsLogo },
+  { label: 'Next.js', framework: 'next', ui: true, server: true, logo: nextLogo },
+  { label: 'Nuxt', framework: 'nuxt', ui: true, server: true, logo: nuxtLogo },
+  { label: 'SvelteKit', framework: 'sveltekit', ui: true, server: true, logo: svelteLogo },
+  { label: 'Remix', framework: 'remix', ui: true, server: true, logo: remixLogo },
+  { label: 'Astro', framework: 'astro', ui: true, server: true, logo: astroLogo },
+  { label: 'Angular', framework: 'angular', ui: true, server: true, logo: angularLogo },
+  { label: 'Command Line', framework: '', ui: false, server: false, logo: null },
+  { label: 'Library', framework: '', ui: false, server: false, logo: null, kind: 'package' },
 ]
 
 // The launcher runs either as the first window (the whole app, when no project
@@ -60,6 +74,7 @@ export function Launcher() {
   const [name, setName] = useState('')
   const [dir, setDir] = useState('')
   const [ui, setUi] = useState(true)
+  const [projectType, setProjectType] = useState<'ui' | 'cli' | 'package'>('ui')
   const [framework, setFramework] = useState('react-ts')
 
   // Open-by-path field.
@@ -75,6 +90,19 @@ export function Launcher() {
     document.documentElement.classList.add('launcher-window')
     void recentProjects().then(setRecents)
     return () => document.documentElement.classList.remove('launcher-window')
+  }, [])
+
+  // The Setup menu (macOS global menu bar) also reaches the launcher; open the
+  // same pop-up the gear button does.
+  useEffect(() => {
+    const off = peko.on('menu', (data: unknown) => {
+      const id = (data as { id?: string } | null)?.id
+      if (id === 'setup.updateCli') void openSetupWindow('update')
+      else if (id === 'setup.resetupSdk') void openSetupWindow('resetup')
+      else if (id === 'setup.globalPackages') void openSetupWindow('packages')
+      else if (id === 'setup.uninstall') void openSetupWindow('uninstall')
+    })
+    return off
   }, [])
 
   // Slide between the home and detail panes by scrolling the viewport to an
@@ -107,8 +135,10 @@ export function Launcher() {
   }, [view])
 
   function goConfigure(template: (typeof TEMPLATES)[number]) {
-    setUi(template.ui)
-    if (template.ui) setFramework(template.framework)
+    const kind = (template as { kind?: string }).kind === 'package' ? 'package' : template.ui ? 'ui' : 'cli'
+    setProjectType(kind)
+    setUi(kind === 'ui')
+    if (kind === 'ui') setFramework(template.framework)
     setError('')
     setView('configure')
   }
@@ -155,8 +185,9 @@ export function Launcher() {
     const result = await newProject({
       name: name.trim(),
       dir: dir.trim() || undefined,
+      type: projectType,
       ui,
-      framework: ui ? framework : undefined,
+      framework: projectType === 'ui' ? framework : undefined,
     })
     setBusy(false)
     if ('error' in result) {
@@ -173,6 +204,16 @@ export function Launcher() {
           <PekoMark />
         </span>
         <span className="launcher-title">Peko Studio</span>
+        <button
+          type="button"
+          className="launcher-x launcher-setup"
+          data-peko-no-drag
+          onClick={() => void openSetupWindow()}
+          aria-label="Peko setup"
+          title="Peko setup: update the CLI, re-setup the SDK, global packages, uninstall"
+        >
+          ⚙
+        </button>
         <button
           type="button"
           className="launcher-x"
@@ -206,6 +247,18 @@ export function Launcher() {
                     </span>
                   )}
                   <span className="launcher-card-label">{t.label}</span>
+                  {t.ui && (
+                    <span
+                      className={`launcher-card-badge ${t.server ? 'ssr' : 'ssg'}`}
+                      title={
+                        t.server
+                          ? 'Server-rendered (SSR), deployed to Peko hosting'
+                          : 'Static (SSG), runs in a native window'
+                      }
+                    >
+                      {t.server ? 'SSR' : 'SSG'}
+                    </span>
+                  )}
                 </button>
               ))}
             </div>
@@ -264,11 +317,20 @@ export function Launcher() {
                 <label>
                   <span>Framework</span>
                   <select value={framework} onChange={(e) => setFramework(e.target.value)}>
-                    {TEMPLATES.filter((t) => t.ui).map((t) => (
-                      <option key={t.framework} value={t.framework}>
-                        {t.label}
-                      </option>
-                    ))}
+                    <optgroup label="Static (native window)">
+                      {TEMPLATES.filter((t) => t.ui && !t.server).map((t) => (
+                        <option key={t.framework} value={t.framework}>
+                          {t.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Server (SSR, hosted)">
+                      {TEMPLATES.filter((t) => t.ui && t.server).map((t) => (
+                        <option key={t.framework} value={t.framework}>
+                          {t.label}
+                        </option>
+                      ))}
+                    </optgroup>
                   </select>
                 </label>
               )}

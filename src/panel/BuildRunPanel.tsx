@@ -70,6 +70,7 @@ export function BuildRunPanel({
     names: [],
   })
   const [traces, setTraces] = useState<TraceEntry[]>([])
+  const [bridgeState, setBridgeState] = useState<string>('')
   const [signing, setSigning] = useState<PlatformSigning[]>([])
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null)
   const [route, setRoute] = useState<string>('')
@@ -93,11 +94,19 @@ export function BuildRunPanel({
       switch (e.t) {
         case 'status':
           if (typeof e.state === 'string') setRunState(e.state as RunState)
+          if (e.state === 'idle') setBridgeState('')
           if (typeof e.text === 'string') appendOutput('stdout', String(e.text))
           break
-        case 'output':
-          appendOutput((e.stream as LogLine['stream']) ?? 'stdout', String(e.text ?? ''))
+        case 'output': {
+          const line = String(e.text ?? '')
+          // The app tags its bridge lifecycle lines; surface the latest as the
+          // Bridge tab's health so a mint/connect failure is visible there, not
+          // just buried in the output log.
+          const marker = line.indexOf('[peko-bridge]')
+          if (marker !== -1) setBridgeState(line.slice(marker + '[peko-bridge]'.length).trim())
+          appendOutput((e.stream as LogLine['stream']) ?? 'stdout', line)
           break
+        }
         case 'console': {
           const level = (e.level as ConsoleLine['level']) ?? 'log'
           const text = String(e.text ?? '')
@@ -306,7 +315,9 @@ export function BuildRunPanel({
             onComplete={(base) => void invokeSafe('ide.run.complete', { code: base })}
           />
         )}
-        {tab === 'bridge' && <BridgeView traces={traces} onClear={() => setTraces([])} />}
+        {tab === 'bridge' && (
+          <BridgeView traces={traces} status={bridgeState} onClear={() => setTraces([])} />
+        )}
         {tab === 'page' && (
           <PageView
             info={pageInfo}
@@ -930,12 +941,30 @@ function PageView({
   )
 }
 
-function BridgeView({ traces, onClear }: { traces: TraceEntry[]; onClear: () => void }) {
+function BridgeView({
+  traces,
+  status,
+  onClear,
+}: {
+  traces: TraceEntry[]
+  status: string
+  onClear: () => void
+}) {
+  // The bridge's live health, from the app's [peko-bridge] lifecycle lines.
+  const health = status ? <div className="trace-status">bridge: {status}</div> : null
   if (traces.length === 0) {
-    return <div className="brpanel-empty">No bridge traffic. Enable tracing on the running app.</div>
+    return (
+      <div className="log-view">
+        {health}
+        <div className="brpanel-empty">
+          No bridge traffic yet — interact with the running app to see its native calls.
+        </div>
+      </div>
+    )
   }
   return (
     <div className="log-view">
+      {health}
       <div className="log-toolbar">
         <button className="log-clear" onClick={onClear}>
           Clear

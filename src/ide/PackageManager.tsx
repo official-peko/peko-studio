@@ -4,14 +4,23 @@
 // `peko add` / `peko remove`). The Browse tab searches the public registry index
 // and installs directly.
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { listPackages, addPackage, removePackage, type Package } from './workspace'
+import { listPackages, addPackage, removePackage, globalRoot, type Package } from './workspace'
 import { registrySearch, type RegistryPackage } from './registry'
 
 type Tab = 'installed' | 'browse'
 
-export function PackageManager({ root, onClose }: { root: string; onClose: () => void }) {
+export function PackageManager({
+  root,
+  global = false,
+  onClose,
+}: {
+  root?: string
+  global?: boolean
+  onClose: () => void
+}) {
   const [tab, setTab] = useState<Tab>('installed')
-  const [scope, setScope] = useState<'local' | 'global'>('local')
+  const [scope, setScope] = useState<'local' | 'global'>(global || !root ? 'global' : 'local')
+  const [globalDir, setGlobalDir] = useState('')
   const [packages, setPackages] = useState<Package[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -19,14 +28,28 @@ export function PackageManager({ root, onClose }: { root: string; onClose: () =>
 
   const installedNames = useMemo(() => new Set(packages.map((p) => p.name)), [packages])
 
+  // The manifest whose dependencies the Installed tab lists and whose packages
+  // remove targets: the project for local scope, the shared global library for
+  // global scope.
+  const effectiveRoot = scope === 'global' ? globalDir : root ?? ''
+
+  useEffect(() => {
+    void globalRoot().then(setGlobalDir)
+  }, [])
+
   function refresh() {
+    if (!effectiveRoot) {
+      setPackages([])
+      setLoading(false)
+      return
+    }
     setLoading(true)
-    void listPackages(root).then((list) => {
+    void listPackages(effectiveRoot).then((list) => {
       setPackages(list)
       setLoading(false)
     })
   }
-  useEffect(refresh, [root])
+  useEffect(refresh, [effectiveRoot])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -38,14 +61,13 @@ export function PackageManager({ root, onClose }: { root: string; onClose: () =>
 
   async function install(name: string, version?: string) {
     if (busy) return
-    const global = scope === 'global'
+    const isGlobal = scope === 'global'
     setBusy(true)
-    setOutput(`Installing ${name}${version ? ` ${version}` : ''}${global ? ' globally' : ''}...`)
-    const result = await addPackage({ name, version, global })
+    setOutput(`Installing ${name}${version ? ` ${version}` : ''}${isGlobal ? ' globally' : ''}...`)
+    const result = await addPackage({ name, version, global: isGlobal })
     setBusy(false)
     setOutput(result.output.trim() || (result.ok ? 'Done.' : 'Failed.'))
-    // A global install does not change the project's dependency list.
-    if (result.ok && !global) refresh()
+    if (result.ok) refresh()
     return result.ok
   }
 
@@ -53,7 +75,7 @@ export function PackageManager({ root, onClose }: { root: string; onClose: () =>
     if (busy) return
     setBusy(true)
     setOutput(`Removing ${name}...`)
-    const result = await removePackage(name)
+    const result = await removePackage(name, scope === 'global')
     setBusy(false)
     setOutput(result.output.trim() || (result.ok ? 'Done.' : 'Failed.'))
     if (result.ok) refresh()

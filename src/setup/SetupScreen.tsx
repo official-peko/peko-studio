@@ -19,10 +19,22 @@ type SetupEvent = {
 export function SetupScreen({
   pekoPresent,
   onDone,
+  mode = 'setup',
+  onClose,
+  latest,
 }: {
   pekoPresent: boolean
   onDone: () => void
+  // 'setup' is the first-run install; 'update' is an in-IDE update overlay;
+  // 'resetup' forces a clean re-download of the SDK/toolchains (peko setup --force).
+  mode?: 'setup' | 'update' | 'resetup'
+  // Dismiss handler. First-run closes the window; an overlay hides itself.
+  onClose?: () => void
+  latest?: string | null
 }) {
+  const resetup = mode === 'resetup'
+  const updating = mode !== 'setup'
+  const close = onClose ?? (() => peko.window.close())
   const [running, setRunning] = useState(false)
   const [installWindows, setInstallWindows] = useState(false)
   const [acceptLicense, setAcceptLicense] = useState(false)
@@ -100,7 +112,10 @@ export function SetupScreen({
     setDone(false)
     setProgress(null)
     setRunning(true)
-    void peko.invoke('ide.setup.run', { windows: installWindows && acceptLicense })
+    void peko.invoke('ide.setup.run', {
+      windows: installWindows && acceptLicense,
+      force: resetup,
+    })
   }
 
   const canInstall = !running && !done && (!installWindows || acceptLicense)
@@ -108,12 +123,7 @@ export function SetupScreen({
   return (
     <div className="setup-shell">
       <div className="setup-drag" data-peko-drag />
-      <button
-        className="setup-close"
-        onClick={() => peko.window.close()}
-        aria-label="Close"
-        title="Close"
-      >
+      <button className="setup-close" onClick={close} aria-label="Close" title="Close">
         &times;
       </button>
       <div className="setup-card">
@@ -122,11 +132,15 @@ export function SetupScreen({
             <PekoMark />
           </span>
           <div>
-            <h1>Welcome to Peko Studio</h1>
+            <h1>{resetup ? 'Re-setup the Peko SDK' : updating ? 'Update Peko' : 'Welcome to Peko Studio'}</h1>
             <p className="setup-sub">
-              {pekoPresent
-                ? 'The Peko toolchain needs to be installed before you can build. This downloads the compiler, the standard library, and the platform toolchains.'
-                : 'Peko is not installed yet. This downloads the Peko CLI and the full toolchain, then sets up your environment.'}
+              {resetup
+                ? 'Re-download and reinstall the compiler, standard library, and platform toolchains from the latest GitHub release, even if they are already current. Use this to repair a broken or partial install.'
+                : updating
+                  ? `A new Peko release${latest ? ` (${latest})` : ''} is available. This updates the compiler, the standard library, and the platform toolchains; unchanged components are skipped.`
+                  : pekoPresent
+                    ? 'The Peko toolchain needs to be installed before you can build. This downloads the compiler, the standard library, and the platform toolchains.'
+                    : 'Peko is not installed yet. This downloads the Peko CLI and the full toolchain, then sets up your environment.'}
             </p>
           </div>
         </div>
@@ -190,7 +204,29 @@ export function SetupScreen({
 
         <div className="setup-actions">
           <button className="setup-install" onClick={start} disabled={!canInstall}>
-            {running ? 'Installing...' : done ? 'Finishing...' : error ? 'Retry' : 'Install'}
+            {resetup
+              ? running
+                ? 'Re-installing...'
+                : done
+                  ? 'Finishing...'
+                  : error
+                    ? 'Retry'
+                    : 'Re-setup'
+              : updating
+              ? running
+                ? 'Updating...'
+                : done
+                  ? 'Finishing...'
+                  : error
+                    ? 'Retry'
+                    : 'Update'
+              : running
+                ? 'Installing...'
+                : done
+                  ? 'Finishing...'
+                  : error
+                    ? 'Retry'
+                    : 'Install'}
           </button>
         </div>
       </div>
