@@ -111,6 +111,10 @@ export function registerPekoLanguage(): void {
           ['delimiter.tag', { token: 'tag', next: '@tag' }],
         ],
 
+        // `demo` is a contextual keyword: highlighted only when it leads a
+        // `demo { ... }` block, and left an identifier everywhere else.
+        [/\bdemo\b(?=\s*\{)/, 'keyword'],
+
         // Identifiers and keywords.
         [/[a-zA-Z_]\w*(?=\s*::)/, 'namespace'],
         [

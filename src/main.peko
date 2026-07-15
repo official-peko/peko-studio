@@ -2909,28 +2909,27 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 		},
 	);
 
-	// ide.clean wipes the project's incremental build cache (peko build --clean,
-	// which deletes .peko/incremental and exits without building), streaming to
-	// the build output view. Reply: {ok}.
+	// ide.clean removes the project's build artifacts (peko clean: the
+	// incremental cache, the build folder, and the framework's own clean),
+	// streaming to the build output view. Reply: {ok}.
 	application.on(
 		"ide.clean",
 		closure[application](params: string) => string {
 			let args: Array<string> = new Array<string>();
-			args.push("build");
-			args.push("--clean");
+			args.push("clean");
 			application.emit(
 				"ide.build:event",
-				`{"t":"output","stream":"stdout","text":"Cleaning incremental build cache..."}`,
+				`{"t":"output","stream":"stdout","text":"Cleaning build artifacts..."}`,
 			);
 			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
 			if !spawned.is_value() {
 				application.emit(
 					"ide.build:event",
-					`{"t":"output","stream":"stderr","text":"could not launch peko build --clean"}`,
+					`{"t":"output","stream":"stderr","text":"could not launch peko clean"}`,
 				);
 				return `{"ok":false}`;
 			}
-			stream_process(application, spawned.unwrap(), "ide.build:event", "peko build --clean");
+			stream_process(application, spawned.unwrap(), "ide.build:event", "peko clean");
 			return `{"ok":true}`;
 		},
 	);
