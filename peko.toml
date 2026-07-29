@@ -22,3 +22,13 @@ source = "icon/appicon.png"
 project = "icon/appicon.pekoicon"
 android_foreground = "icon/appicon-foreground.png"
 android_background = "icon/appicon-background.png"
+
+# A Windows release build always packages an MSIX, and the package identity
+# cannot be derived, so these three keys are required to build for Windows at
+# all. Studio ships the .exe rather than the MSIX, so these are placeholders
+# that satisfy the build. Replace all three with the reserved identity from
+# Partner Center before submitting to the Microsoft Store.
+[windows]
+identity_name = "PekoUITechnologies.PekoStudio"
+publisher = "CN=Peko UI Technologies LLC"
+publisher_display_name = "Peko UI Technologies LLC"

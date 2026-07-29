@@ -25,9 +25,13 @@ Around the editor:
   dependencies.
 - An icon builder that edits layered `.pekoicon` documents and exports the
   per-platform icon set.
-- Signing and deploy panels for managing keys and shipping a release.
+- A Signing tab, one sub-tab per target platform, showing what each has and what
+  it still needs. It registers key files, generates an Android keystore or an
+  Apple certificate request, completes the Apple flow from the downloaded `.cer`,
+  and registers the App Store Connect key that notarizes a macOS release.
+- A Deploy tab for linking the project to a platform app and shipping a release.
 - A status-bar account chip that reuses the `peko` CLI session, and per-OS window
-  chrome and theming that persist across launches.
+  chrome, theme, and layout that persist across launches.
 - A first-run setup screen that installs the toolchain when `peko check` reports
   it missing, streaming progress from `peko setup --json`.
 
@@ -116,13 +120,37 @@ To produce distributable bundles:
 ```sh
 peko build
 peko build --platform macos
+peko build --release --platform windows
 ```
+
+## Building a release
+
+`--release` optimizes and runs each platform's signing step, which is where a
+first release build usually stops. What each platform needs:
+
+| Platform | Needs |
+|---|---|
+| macOS | a Developer ID certificate to sign, and an App Store Connect key to notarize. Without them the build warns and the app is unsigned. |
+| Windows | the `[windows]` identity keys in `peko.toml`. Code signing is optional. |
+| Linux | nothing; AppImages are not signed. |
+
+The Windows case is the one that fails rather than warns. A Windows release always
+packages an MSIX alongside the `.exe`, and the package identity cannot be derived,
+so `identity_name`, `publisher`, and `publisher_display_name` have to be present
+or the build stops. Studio ships the `.exe`, so the values in `peko.toml` are
+placeholders that satisfy the build; replace them with the reserved identity from
+Partner Center before submitting to the Microsoft Store.
+
+Signing material is registered from the Signing tab, or with `peko keys`. It lives
+in `.peko/keys/` with passwords in the OS keychain, so none of it is committed.
 
 ## Repository notes
 
 `assets/`, `dist/`, `build/`, `.peko/`, and `node_modules/` are build output and
-are gitignored. So is `peko.lock`, because the project resolves `pekoui` through
-a local path dependency, which makes the lockfile specific to one machine.
+are gitignored, as is `peko.lock`.
+
+Take care not to commit signing material or a password file. `.peko/` is ignored,
+but a `--password-file` written elsewhere in the tree is not.
 
 ## Contributing
 
