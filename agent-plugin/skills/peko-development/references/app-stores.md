@@ -236,7 +236,7 @@ step. It produces no screenshots; it confirms the shot scripts navigate, find
 elements, and interact as written.
 
 The app declares fixtures and shots under `[demo]` in `peko.toml`, depends on
-`pekoshots`, and calls `pekoshots::runtime::attach` from its entry. Shot scripts
+`pekoshots`, and calls `pekoshots::driver::attach` from its entry. Shot scripts
 are event-gated: wait for a condition rather than sleeping, and use a fixed delay
 only for presentation pacing.
 

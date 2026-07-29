@@ -12,15 +12,16 @@ import pekoui::env;
 ```
 
 Its modules are `app`, `webview`, `assets`, `storage`, `keychain`, `menu`,
-`bridge`, `dialog`, and `env`.
+`bridge`, `dialog`, `env`, and `paths`.
 
 ## Project shape
 
 `[ui]` in `peko.toml` marks the project as an app.
 
 - `framework` is the web template (`react-ts` by default).
-- `server_framework` set means it is an SSR app that can be hosted. Absent means
-  a static or on-device app that serves its bundled UI from a loopback server.
+- An SSR framework id (`next`, `nuxt`, `sveltekit`, `remix`, `astro`,
+  `angular`) means it is an SSR app that can be hosted. `native` or `static`
+  means an on-device app that serves its bundled UI from a loopback server.
 - `icon` is a square PNG. `scheme` registers a custom URL scheme for deep links.
 - `width` and `height` set the initial window size.
 - `[project].target_platforms` decides what `peko build` produces.
@@ -33,7 +34,7 @@ and runs it:
 ```peko
 import pekoui as ui;
 
-fn main() {
+fn on_start() {
     let application: ui::app::App = ui::app::from_bundle();
 
     application.on("ide.fs.tree", closure(params: string) => string {
@@ -92,7 +93,10 @@ present as "no events arriving" rather than as an error.
 
 ### Window chrome
 
-Desktop windows are frameless, so the web side draws its own titlebar.
+Windows are decorated by default. An app opts into a frameless window with
+`view.set_decorations(false)`, and then draws its own titlebar in the web layer.
+On macOS, add `view.set_custom_controls(true)` or the OS keeps drawing the
+traffic lights over your chrome.
 
 - `peko.window.minimize()`, `.maximize()`, `.close()` drive the host window.
 - Declarative equivalents exist as `data-peko-*` attributes, including a drag
@@ -100,8 +104,11 @@ Desktop windows are frameless, so the web side draws its own titlebar.
 - `peko.windows.open(...)` and `.close(...)` manage secondary windows. On desktop
   a second window is a second process of the same binary sharing the opener's
   bridge; on mobile and web it degrades to a modal or iframe.
-- `peko.menu` builds the application menu. On Windows the menu is drawn in HTML
-  rather than by the OS.
+- `peko.menu` builds the application menu. macOS and Linux always get a native
+  bar. Windows gets one only on a decorated window, because the menu lives in
+  the non-client area; a frameless Windows app calls `use_html_menu()` and the
+  client SDK renders it. Both routes emit the same `menu` event, so one handler
+  serves both.
 
 ### Storage caveat
 

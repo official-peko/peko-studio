@@ -113,7 +113,7 @@ platform's infrastructure, behind a CDN, at a stable
    platform builds the container and runs it.
 3. The CLI polls for status and prints the URL once the app is live.
 
-Requirements: an `[ui].server_framework`, default `next`. Next must emit a
+Requirements: `[ui].framework` set to the SSR id itself. Next must emit a
 standalone build, which `peko project new` configures. Supported frameworks are
 Next.js, Nuxt, SvelteKit, Remix / React Router, Astro, and Angular. The CLI emits
 the matching build and Dockerfile per framework, and the container listens on

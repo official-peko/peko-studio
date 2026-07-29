@@ -18,7 +18,8 @@ Read `peko.toml` first. It decides what every command does.
 - `[project]` has `name`, `version`, `bundle` (reverse-DNS id), `entry` (the main
   source file), and `target_platforms` (which OSes `peko build` produces).
 - `[ui]` present means it is an app with a web frontend. `framework` is the web
-  template; `server_framework` set means it is an SSR app that can be hosted.
+  template. An SSR framework id there (`next`, `nuxt`, `sveltekit`, `remix`,
+  `astro`, `angular`) means it is an SSR app that can be hosted.
 - `[package]` plus `[lib]` instead of `[project]` means it is a library, and it
   is published rather than built into an app.
 - `[dependencies]` lists packages. `peko.lock` pins resolved versions; never
@@ -92,24 +93,13 @@ Full detail is in `references/pekoscript.md`. The rules that matter most:
 - Classes and constants are PascalCase. Functions, methods, and variables are
   snake_case.
 - A field that a method reassigns needs `[mutates]` on the field.
-- `import std::fs;` imports a module. `std::core` and `std::collections` are
-  auto-imported and used bare; `std::runtime`, `std::json`, and `std::xml` are
-  auto-imported but used through their prefix. Everything else needs an explicit
-  import. `import pekoui as ui;` aliases a whole package.
+- `import std::fs;` imports a module. Six modules are auto-imported: `std::core`
+  and `std::collections` are used bare, and `std::runtime`, `std::json`,
+  `std::xml`, and `std::bundle` are used through their prefix. Everything else
+  needs an explicit import. `import pekoui as ui;` aliases a whole package.
 - Reserved words cannot be used as identifiers or FFI parameter names. `fn`,
   `in`, and `arch` are the ones that bite most often; a `let arch` produces a
   cascade of unrelated-looking parse errors.
-
-### Comment rules (enforced)
-
-Comments in `.peko`, `.c`, `.m`, and `.peko.h` files follow strict rules:
-
-- ASCII only. No em dashes, en dashes, arrows, smart quotes, or ellipsis
-  characters. Use `-` or rewrite the sentence.
-- Short declarative sentences describing what the code does.
-- Never describe history. No "previously", "changed from", "now uses instead".
-- Never address the reader. No second person, no "TODO: you", no asides.
-- A comment describes only the code it sits on.
 
 ## Garbage collection and FFI
 
