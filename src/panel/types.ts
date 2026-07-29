@@ -3,7 +3,7 @@
 // DevConsoleLine) so the native layer can forward them over the bridge with
 // minimal translation.
 
-export type PanelTab = 'problems' | 'output' | 'console' | 'bridge' | 'page' | 'signing'
+export type PanelTab = 'problems' | 'output' | 'console' | 'bridge' | 'page' | 'signing' | 'deploy'
 
 export type ResourceType = 'document' | 'script' | 'style' | 'image' | 'json' | 'font' | 'other'
 
@@ -91,6 +91,11 @@ export interface KeyCheck {
 // (which runs `peko keys verify --json`). Mirrors signing::PlatformReport.
 export interface PlatformSigning {
   platform: string
-  state: 'missing' | 'invalid' | 'unverified' | 'valid'
+  // not_required: the platform has no signing model (Linux).
+  // optional: signing is available but absent — the build still ships (Windows).
+  state: 'not_required' | 'optional' | 'missing' | 'invalid' | 'unverified' | 'valid'
+  // Whether the platform must be signed to ship, so a caller can gate on the
+  // requirement instead of inferring it from the platform name.
+  requirement?: 'required' | 'optional' | 'not_applicable'
   checks: KeyCheck[]
 }

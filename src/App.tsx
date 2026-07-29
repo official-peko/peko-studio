@@ -533,10 +533,10 @@ export default function App() {
           <span className="spacer" />
           <button
             className={`status-toggle${showAgent ? ' active' : ''}`}
-            title="Toggle the AI assistant"
+            title="Toggle the AI agent"
             onClick={() => setShowAgent((v) => !v)}
           >
-            Assistant
+            Agent
           </button>
           <button
             className="status-toggle"
@@ -559,18 +559,10 @@ export default function App() {
           >
             Packages
           </button>
-          <button
-            className="status-toggle status-gear"
-            title="Project settings"
-            aria-label="Project settings"
-            onClick={() => setShowSettings(true)}
-          >
-            ⚙
-          </button>
           {update && (
             <button
               className="status-toggle status-update"
-              title={`A new Peko version${update.latest ? ` (${update.latest})` : ''} is available — click to update`}
+              title={`A new Peko version${update.latest ? ` (${update.latest})` : ''} is available. Click to update.`}
               onClick={() => void openSetupWindow('update')}
             >
               Update ●
@@ -582,7 +574,7 @@ export default function App() {
       </div>
 
       {/* Kept mounted so the slide transition fires on every open, and so the
-          assistant session and transcript survive being closed and reopened. */}
+          agent session and transcript survive being closed and reopened. */}
       {boot?.root && (
         <div className={`agent-rail${showAgent ? ' open' : ''}`}>
           <AgentPanel root={boot.root} onOpenFile={openTab} />

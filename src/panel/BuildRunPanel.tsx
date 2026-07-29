@@ -9,6 +9,9 @@ import {
 import { createPortal } from 'react-dom'
 import { peko } from '@peko/client'
 import { Highlight } from './highlight'
+import { DeployView } from './DeployPanel'
+import { SigningView } from './SigningPanel'
+import { PLATFORM_LABEL, needsAttention } from './signingShared'
 import type {
   ConsoleLine,
   Diagnostic,
@@ -22,12 +25,14 @@ import type {
   TraceEntry,
 } from './types'
 
-const PLATFORM_LABEL: Record<string, string> = {
-  macos: 'macOS',
-  windows: 'Windows',
-  linux: 'Linux',
-  ios: 'iOS',
-  android: 'Android',
+/// Pretty-print a JSON body for the bridge and page views, leaving anything
+/// that is not JSON untouched.
+function prettyJson(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2)
+  } catch {
+    return text
+  }
 }
 
 // A monotonic id source for streamed lines (stable React keys).
@@ -56,6 +61,17 @@ export function BuildRunPanel({
   onOpenFile: (path: string, line: number, column: number) => void
 }) {
   const [tab, setTab] = useState<PanelTab>('problems')
+  // Deploy output and outcome live here, not in DeployView: a deploy runs for
+  // minutes and switching tabs must not discard its log.
+  const [deployOutput, setDeployOutput] = useState<LogLine[]>([])
+  const [deploying, setDeploying] = useState(false)
+  const [deployResult, setDeployResult] = useState<{
+    ok: boolean
+    kind?: string
+    state?: string
+    url?: string | null
+    error?: string
+  } | null>(null)
   const [runState, setRunState] = useState<RunState>('idle')
   const [target, setTarget] = useState(
     () => (platforms.includes(hostPlatform) ? hostPlatform : platforms[0]) ?? hostPlatform,
@@ -146,11 +162,47 @@ export function BuildRunPanel({
           break
       }
     }
+    // The deploy stream is handled separately: its lines belong to the Deploy
+    // tab's own log, and the CLI's `result` event carries the outcome the panel
+    // reports rather than the panel inferring it from the last line.
+    const handleDeploy = (raw: unknown) => {
+      const e = raw as { t?: string; [k: string]: unknown }
+      if (e.t === 'status') {
+        if (e.state === 'deploying') setDeploying(true)
+        if (e.state === 'idle') setDeploying(false)
+        return
+      }
+      if (e.t !== 'output') return
+      const text = String(e.text ?? '')
+      const stream = (e.stream as LogLine['stream']) ?? 'stdout'
+      // The CLI emits one JSON object per line on stdout in --json mode. Events
+      // become log text; the terminal `result` sets the outcome. Anything that
+      // is not JSON is a tool writing directly to the stream, shown as-is.
+      let shown = text
+      try {
+        const event = JSON.parse(text) as Record<string, unknown>
+        if (event.type === 'result') {
+          setDeployResult(event as never)
+          setDeploying(false)
+          return
+        }
+        shown =
+          typeof event.message === 'string'
+            ? `${String(event.type ?? 'info')}: ${event.message}`
+            : text
+      } catch {
+        // Not JSON — raw tool output.
+      }
+      setDeployOutput((prev) => [...prev.slice(-4000), { id: nextId++, stream, text: shown }])
+    }
+
+    const unsubDeploy = peko.on('ide.deploy:event', handleDeploy)
     const unsubRun = peko.on('ide.run:event', handle)
     const unsubBuild = peko.on('ide.build:event', handle)
     return () => {
       unsubRun?.()
       unsubBuild?.()
+      unsubDeploy?.()
     }
   }, [])
 
@@ -292,12 +344,44 @@ export function BuildRunPanel({
         <PanelTabButton id="page" tab={tab} onSelect={setTab}>
           Page
         </PanelTabButton>
-        <PanelTabButton id="signing" tab={tab} onSelect={setTab}>
+        <PanelTabButton
+          id="signing"
+          tab={tab}
+          onSelect={setTab}
+          // A count of platforms that cannot ship without keys and do not have
+          // them, so the strip says there is something to fix without opening
+          // the tab. Optional and unsigned platforms are excluded: they are a
+          // choice, not a problem.
+          badge={signing.filter((s) => needsAttention(s.state)).length || undefined}
+        >
           Signing
+        </PanelTabButton>
+        <PanelTabButton id="deploy" tab={tab} onSelect={setTab}>
+          Deploy
         </PanelTabButton>
       </div>
 
       <div className="brpanel-body">
+        {tab === 'deploy' && (
+          <DeployView
+            platforms={platforms}
+            output={deployOutput}
+            deploying={deploying}
+            result={deployResult}
+            onClear={() => {
+              setDeployOutput([])
+              setDeployResult(null)
+            }}
+            onStart={(kind) => {
+              setDeployOutput([])
+              setDeployResult(null)
+              setDeploying(true)
+              setTab('deploy')
+              void invokeSafe('ide.deploy.start', { kind })
+            }}
+            onStop={() => void invokeSafe('ide.deploy.stop', {})}
+          />
+        )}
         {tab === 'problems' && <ProblemsView diagnostics={diagnostics} onOpenFile={onOpenFile} />}
         {tab === 'output' && (
           <OutputView lines={output} root={root} onOpenFile={onOpenFile} onClear={() => setOutput([])} />
@@ -957,7 +1041,7 @@ function BridgeView({
       <div className="log-view">
         {health}
         <div className="brpanel-empty">
-          No bridge traffic yet — interact with the running app to see its native calls.
+          No bridge traffic yet. Use the running app to see its native calls.
         </div>
       </div>
     )
@@ -994,254 +1078,3 @@ function normalizeQuotes(text: string): string {
 
 // The platforms whose applications are code-signed. Others (Linux) declare no
 // signing material.
-const SIGNABLE_PLATFORMS = ['android', 'ios', 'macos', 'windows']
-
-// The password-carrying roles the CLI keychain stores per platform.
-const SECRET_ROLES: Record<string, { role: string; label: string }[]> = {
-  android: [
-    { role: 'store', label: 'Keystore password' },
-    { role: 'key', label: 'Key password' },
-  ],
-  macos: [{ role: 'p12', label: 'Certificate password' }],
-  ios: [{ role: 'p12', label: 'Certificate password' }],
-  windows: [{ role: 'pfx', label: 'Certificate password' }],
-}
-
-// The prompt shown in a platform's drop zone.
-const DROP_HINT: Record<string, string> = {
-  android: 'Drop a keystore (.jks / .keystore / .p12), or click to browse',
-  macos: 'Drop a signing certificate (.p12), or click to browse',
-  ios: 'Drop a certificate (.p12) or profile (.mobileprovision), or click to browse',
-  windows: 'Drop a signing certificate (.pfx / .p12), or click to browse',
-}
-
-// The file types a platform's picker offers.
-const DROP_ACCEPT: Record<string, string> = {
-  android: '.jks,.keystore,.p12',
-  macos: '.p12,.entitlements,.plist',
-  ios: '.p12,.mobileprovision,.entitlements,.plist',
-  windows: '.pfx,.p12',
-}
-
-// Given a platform and a dropped file name, the registry role it fills, or null
-// when the file type does not belong to that platform.
-function roleForDrop(platform: string, filename: string): string | null {
-  const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase()
-  if (platform === 'android') return ['.jks', '.keystore', '.p12'].includes(ext) ? 'keystore' : null
-  if (platform === 'windows') return ['.pfx', '.p12'].includes(ext) ? 'pfx' : null
-  if (platform === 'macos') {
-    if (ext === '.p12') return 'p12'
-    if (ext === '.entitlements' || ext === '.plist') return 'entitlements'
-    return null
-  }
-  if (platform === 'ios') {
-    if (ext === '.p12') return 'p12'
-    if (ext === '.mobileprovision') return 'profile'
-    if (ext === '.entitlements' || ext === '.plist') return 'entitlements'
-    return null
-  }
-  return null
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer()
-  let binary = ''
-  const bytes = new Uint8Array(buffer)
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i])
-  return btoa(binary)
-}
-
-function SigningView({
-  platforms,
-  signing,
-  refresh,
-}: {
-  platforms: string[]
-  signing: PlatformSigning[]
-  refresh: () => Promise<void>
-}) {
-  // Fetch once per mount. A guard keeps a re-render or a double effect invoke
-  // from running `keys verify` twice, which would prompt for keychain access an
-  // extra time.
-  const fetched = useRef(false)
-  useEffect(() => {
-    if (fetched.current) return
-    fetched.current = true
-    void refresh()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-  const byPlatform = new Map(signing.map((s) => [s.platform, s]))
-  const signable = platforms.filter((p) => SIGNABLE_PLATFORMS.includes(p))
-  const unsigned = platforms.filter((p) => !SIGNABLE_PLATFORMS.includes(p))
-  return (
-    <div className="signing-view">
-      {signable.map((platform) => (
-        <SigningCard
-          key={platform}
-          platform={platform}
-          report={byPlatform.get(platform)}
-          refresh={refresh}
-        />
-      ))}
-      {unsigned.map((platform) => (
-        <div key={platform} className="signing-card unsigned">
-          <div className="signing-head">
-            <span className="signing-name">{PLATFORM_LABEL[platform] ?? platform}</span>
-            <span className="signing-status na">no signing</span>
-          </div>
-          <div className="signing-note">
-            {PLATFORM_LABEL[platform] ?? platform} applications are not code-signed. No signing key
-            is needed.
-          </div>
-        </div>
-      ))}
-      {platforms.length === 0 && (
-        <div className="brpanel-empty">No platforms declared in peko.toml.</div>
-      )}
-    </div>
-  )
-}
-
-function SigningCard({
-  platform,
-  report,
-  refresh,
-}: {
-  platform: string
-  report: PlatformSigning | undefined
-  refresh: () => Promise<void>
-}) {
-  const [dragOver, setDragOver] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [secrets, setSecrets] = useState<Record<string, string>>({})
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  const state = report?.state ?? 'missing'
-
-  // Install a key file (from a drop or the file picker): detect its role from
-  // the extension, base64 its bytes to the native layer, then re-verify.
-  const installFile = async (file: File) => {
-    setError(null)
-    const role = roleForDrop(platform, file.name)
-    if (!role) {
-      setError(`${file.name} is not a ${PLATFORM_LABEL[platform] ?? platform} signing file`)
-      return
-    }
-    setBusy(true)
-    try {
-      const data = await fileToBase64(file)
-      const res = (await peko.invoke('ide.signing.install', {
-        platform,
-        role,
-        filename: file.name,
-        data,
-      })) as { ok?: boolean }
-      if (!res.ok) setError(`could not install ${file.name}`)
-      await refresh()
-    } catch (err) {
-      setError(String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const onDrop = (event: React.DragEvent) => {
-    event.preventDefault()
-    setDragOver(false)
-    const file = event.dataTransfer.files[0]
-    if (file) void installFile(file)
-  }
-
-  const saveSecret = async (role: string) => {
-    const value = secrets[role]
-    if (!value) return
-    setBusy(true)
-    try {
-      await peko.invoke('ide.signing.set_password', { platform, role, password: value })
-      setSecrets((prev) => ({ ...prev, [role]: '' }))
-      await refresh()
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div
-      className={`signing-card ${state} ${dragOver ? 'drop-over' : ''}`}
-      onDragOver={(e) => {
-        e.preventDefault()
-        setDragOver(true)
-      }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={onDrop}
-    >
-      <div className="signing-head">
-        <span className="signing-name">{PLATFORM_LABEL[platform] ?? platform}</span>
-        <span className={`signing-status ${state}`}>{state}</span>
-      </div>
-
-      <div className="signing-checks">
-        {(report?.checks ?? []).map((check, i) => (
-          <div key={`${check.role}-${i}`} className="signing-check">
-            <span className={`signing-mark ${check.ok ? (check.unverified ? 'warn' : 'ok') : 'fail'}`} />
-            <div className="signing-check-body">
-              <div className="signing-check-role">
-                {check.role}
-                {check.file && <span className="signing-check-file"> · {check.file}</span>}
-              </div>
-              <div className="signing-check-detail">{check.detail}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <input
-        ref={inputRef}
-        type="file"
-        accept={DROP_ACCEPT[platform] ?? ''}
-        style={{ display: 'none' }}
-        onChange={(e) => {
-          const file = e.target.files?.[0]
-          if (file) void installFile(file)
-          e.target.value = ''
-        }}
-      />
-      <button
-        type="button"
-        className={`signing-dropzone ${dragOver ? 'active' : ''}`}
-        onClick={() => inputRef.current?.click()}
-      >
-        {busy ? 'Working…' : DROP_HINT[platform] ?? 'Drop a signing file, or click to browse'}
-      </button>
-      {error && <div className="signing-error">{error}</div>}
-
-      <div className="signing-secrets">
-        {(SECRET_ROLES[platform] ?? []).map(({ role, label }) => (
-          <div key={role} className="signing-secret">
-            <input
-              type="password"
-              placeholder={label}
-              value={secrets[role] ?? ''}
-              onChange={(e) => setSecrets((prev) => ({ ...prev, [role]: e.target.value }))}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') void saveSecret(role)
-              }}
-            />
-            <button className="br-btn subtle" disabled={!secrets[role]} onClick={() => void saveSecret(role)}>
-              Save
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function prettyJson(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2)
-  } catch {
-    return text
-  }
-}

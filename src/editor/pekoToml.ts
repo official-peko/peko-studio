@@ -29,6 +29,10 @@ const SCHEMA: Record<string, TableSpec> = {
       bundle: { type: 'string', detail: 'Reverse-DNS bundle id' },
       version: { type: 'string', detail: 'Semantic version' },
       app_id: { type: 'string', detail: 'Platform-assigned app id (managed)' },
+      host: {
+        type: 'string',
+        detail: 'Deployed serving host, e.g. <slug>.serve.pekoui.com (managed)',
+      },
       target_platforms: { type: 'array', values: PLATFORMS, detail: 'Platforms to build' },
       entry: { type: 'string', detail: 'Entry .peko file, relative to the project root' },
     },
@@ -54,6 +58,17 @@ const SCHEMA: Record<string, TableSpec> = {
       scheme: { type: 'string', detail: 'Deep-link URL scheme' },
       width: { type: 'number', detail: 'Initial window width' },
       height: { type: 'number', detail: 'Initial window height' },
+    },
+  },
+  windows: {
+    detail: 'Windows Store (MSIX) identity, from Partner Center',
+    keys: {
+      identity_name: {
+        type: 'string',
+        detail: 'Package Identity Name, e.g. Publisher.AppName',
+      },
+      publisher: { type: 'string', detail: 'Package Identity Publisher, e.g. CN=...' },
+      publisher_display_name: { type: 'string', detail: 'Human-readable publisher name' },
     },
   },
   capabilities: {
