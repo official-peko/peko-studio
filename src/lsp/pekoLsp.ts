@@ -256,7 +256,7 @@ export function startPekoLanguageClient(
   connection.onOpen = async () => {
     await connection.request('initialize', {
       processId: null,
-      clientInfo: { name: 'peko-studio', version: '0.1.0' },
+      clientInfo: { name: 'peko-studio', version: '1.0.0' },
       rootUri: workspaceRoot ?? null,
       workspaceFolders: workspaceRoot
         ? [{ uri: workspaceRoot, name: 'workspace' }]
