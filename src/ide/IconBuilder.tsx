@@ -12,7 +12,6 @@ import {
   saveIcon,
   ICON_PLATFORMS,
   type IconArtifacts,
-  type IconDoc,
   type IconPlatform,
 } from './workspace'
 
@@ -388,9 +387,11 @@ function defaultLayers(initial: string): Layer[] {
   ]
 }
 
-// Re-key a loaded layer stack with fresh ids.
+// Re-key a loaded layer stack with fresh ids. The stack comes from a saved
+// document, where strip() removed the runtime id, so each entry is a layer
+// minus that field until this puts a fresh one back.
 function adopt(stack: Record<string, unknown>[]): Layer[] {
-  return stack.map((l) => ({ ...(l as Layer), id: nextId() }))
+  return stack.map((l) => ({ ...(l as unknown as Omit<Layer, 'id'>), id: nextId() }))
 }
 
 // Strip the runtime id before persisting a layer stack.
