@@ -24,6 +24,7 @@ import {
   gitStatus,
   getPrefs,
   setPref,
+  flushPrefs,
   type GitStatus,
   type Manifest,
   type Tab,
@@ -185,11 +186,24 @@ export default function App() {
   // ready. localStorage is only a fast first-paint default; it does not survive
   // restarts because the asset-server origin changes each launch.
   const themeLoaded = useRef(false)
+  const layoutLoaded = useRef(false)
   useEffect(() => {
     void getPrefs().then((prefs) => {
       themeLoaded.current = true
       if (prefs.theme) setTheme(prefs.theme)
+      if (prefs.rail) setRailWidth(Number(prefs.rail) || 232)
+      if (prefs.panelCollapsed) setPanelCollapsed(prefs.panelCollapsed === '1')
+      if (prefs.panelHeight) setPanelHeight(Number(prefs.panelHeight) || 240)
+      // Set last: the state updates above re-run the persisting effects, and
+      // writing there before the stored values arrive would save the defaults
+      // over them.
+      layoutLoaded.current = true
     })
+    // A debounced write can still be pending when the window closes, so flush
+    // it rather than losing the last change made before quitting.
+    const onHide = () => void flushPrefs()
+    window.addEventListener('pagehide', onHide)
+    return () => window.removeEventListener('pagehide', onHide)
   }, [])
 
   useEffect(() => {
@@ -323,16 +337,22 @@ export default function App() {
     setWatchedFiles(tabs.map((tab) => tab.path))
   }, [tabs])
 
+  // The layout sizes persist the same way the theme does: localStorage is the
+  // fast first-paint default, and the native store is what survives a restart.
+  // setPref debounces, so a drag does not write on every frame.
   useEffect(() => {
     localStorage.setItem('peko-rail', String(railWidth))
+    if (layoutLoaded.current) setPref('rail', String(railWidth))
   }, [railWidth])
 
   useEffect(() => {
     localStorage.setItem('peko-panel-collapsed', panelCollapsed ? '1' : '0')
+    if (layoutLoaded.current) setPref('panelCollapsed', panelCollapsed ? '1' : '0')
   }, [panelCollapsed])
 
   useEffect(() => {
     localStorage.setItem('peko-panel-height', String(panelHeight))
+    if (layoutLoaded.current) setPref('panelHeight', String(panelHeight))
   }, [panelHeight])
 
   // Drag the horizontal divider to resize the bottom panel (grows upward).

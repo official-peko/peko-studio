@@ -15,6 +15,7 @@ import {
   openSetupWindow,
   pickFolder,
   type RecentProject,
+  getPrefs,
 } from './workspace'
 import { PekoMark } from '../editor/FileIcon'
 import reactLogo from './logos/react.svg'
@@ -85,7 +86,14 @@ export function Launcher() {
   const viewportRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    // The launcher is its own window, so it reads the theme from the native
+    // store like the editor does. localStorage is only the first-paint guess:
+    // it does not survive a restart, so on its own the launcher would always
+    // open in the default theme.
     applyTheme(localStorage.getItem('peko-theme') ?? 'peko-dark')
+    void getPrefs().then((prefs) => {
+      if (prefs.theme) applyTheme(prefs.theme)
+    })
     // A rounded, transparent window needs a transparent page behind the card.
     document.documentElement.classList.add('launcher-window')
     void recentProjects().then(setRecents)

@@ -138,14 +138,41 @@ export async function getPrefs(): Promise<Record<string, string>> {
   }
 }
 
-/// Merge one preference into the store and persist it.
-export async function setPref(key: string, value: string): Promise<void> {
-  const prefs = await getPrefs()
-  prefs[key] = value
+/// Pending preference writes, flushed together.
+///
+/// Persisting is read-modify-write over one JSON file, so two writes started
+/// before either finished would both read the same base and the later one would
+/// drop the earlier one's key. Collecting them and flushing once removes that
+/// window, and it also collapses a burst from a drag into a single write.
+let pendingPrefs: Record<string, string> = {}
+let prefFlush: ReturnType<typeof setTimeout> | null = null
+
+/// Merge preferences into the store and persist them. Accepts one key or
+/// several; several in one call are guaranteed to land together.
+export function setPref(key: string, value: string): void
+export function setPref(values: Record<string, string>): void
+export function setPref(keyOrValues: string | Record<string, string>, value?: string): void {
+  if (typeof keyOrValues === 'string') pendingPrefs[keyOrValues] = value ?? ''
+  else Object.assign(pendingPrefs, keyOrValues)
+
+  if (prefFlush) clearTimeout(prefFlush)
+  prefFlush = setTimeout(() => void flushPrefs(), 250)
+}
+
+/// Write every pending preference in one read-modify-write.
+export async function flushPrefs(): Promise<void> {
+  if (prefFlush) {
+    clearTimeout(prefFlush)
+    prefFlush = null
+  }
+  const writing = pendingPrefs
+  pendingPrefs = {}
+  if (Object.keys(writing).length === 0) return
   try {
-    await peko.invoke('ide.prefs.set', { data: JSON.stringify(prefs) })
+    const prefs = await getPrefs()
+    await peko.invoke('ide.prefs.set', { data: JSON.stringify({ ...prefs, ...writing }) })
   } catch {
-    // No bridge; the value is kept only for this session.
+    // No bridge; the values are kept only for this session.
   }
 }
 
