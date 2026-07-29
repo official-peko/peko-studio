@@ -23,6 +23,18 @@ import { ILanguageFeaturesService } from 'monaco-editor/esm/vs/editor/common/ser
 import { OutlineModel } from 'monaco-editor/esm/vs/editor/contrib/documentSymbols/browser/outlineModel'
 import { PEKO_LANGUAGE_ID } from './monacoSetup'
 import { fetchDocumentSymbols, type LspDocumentSymbol } from '../lsp/pekoLsp'
+// React's type declarations, inlined at build time. The TypeScript worker has no
+// filesystem, so nothing under node_modules resolves on its own, and semantic
+// checking runs anyway. Without these, correct .tsx code reports errors: a type
+// annotation like `React.ReactNode` needs no import because @types/react
+// declares the UMD global `React`, so when the declarations are absent the
+// namespace is simply missing ("Cannot find namespace 'React'").
+import reactGlobalDts from '../../node_modules/@types/react/global.d.ts?raw'
+import reactDts from '../../node_modules/@types/react/index.d.ts?raw'
+import reactJsxRuntimeDts from '../../node_modules/@types/react/jsx-runtime.d.ts?raw'
+import reactDomDts from '../../node_modules/@types/react-dom/index.d.ts?raw'
+import reactDomClientDts from '../../node_modules/@types/react-dom/client.d.ts?raw'
+import cssTypeDts from '../../node_modules/csstype/index.d.ts?raw'
 
 let configured = false
 
@@ -81,6 +93,23 @@ export function configureBuiltinLanguages(): void {
   ].join('\n')
   ts.typescriptDefaults.addExtraLib(pekoGlobals, 'file:///peko-globals.d.ts')
   ts.javascriptDefaults.addExtraLib(pekoGlobals, 'file:///peko-globals.d.ts')
+
+  // React's declarations, at the node_modules paths the worker's NodeJs
+  // resolution looks for, so `import { useState } from 'react'` resolves and the
+  // UMD `React` namespace exists. csstype backs React.CSSProperties; without it
+  // every style prop degrades to an error inside React's own .d.ts.
+  const typeLibs: Array<[string, string]> = [
+    ['file:///node_modules/csstype/index.d.ts', cssTypeDts],
+    ['file:///node_modules/@types/react/global.d.ts', reactGlobalDts],
+    ['file:///node_modules/@types/react/index.d.ts', reactDts],
+    ['file:///node_modules/@types/react/jsx-runtime.d.ts', reactJsxRuntimeDts],
+    ['file:///node_modules/@types/react-dom/index.d.ts', reactDomDts],
+    ['file:///node_modules/@types/react-dom/client.d.ts', reactDomClientDts],
+  ]
+  for (const [path, contents] of typeLibs) {
+    ts.typescriptDefaults.addExtraLib(contents, path)
+    ts.javascriptDefaults.addExtraLib(contents, path)
+  }
   // Keep every open model synced into the worker so cross-file features
   // (definition, references, rename) work across tabs, not just the active one.
   ts.typescriptDefaults.setEagerModelSync(true)
