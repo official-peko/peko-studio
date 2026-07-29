@@ -10,7 +10,10 @@ export type PermissionMode = 'ask' | 'acceptEdits' | 'plan' | 'bypassPermissions
 export type AgentItem =
   | { kind: 'system'; model?: string; sessionId?: string; tools?: string[] }
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; id: string; name: string; summary: string; input: unknown }
+  // toolId is the agent's own id for the call, kept distinct from the numeric
+  // id the panel assigns each transcript entry. Naming both `id` let the entry
+  // id overwrite this one, which lost the only key tying a result to its call.
+  | { kind: 'tool'; toolId: string; name: string; summary: string; input: unknown }
   | { kind: 'tool_result'; toolUseId: string; text: string; isError: boolean }
   | { kind: 'result'; text: string; costUsd?: number; error: boolean }
   | { kind: 'permission'; requestId: string; tool: string; summary: string; input: unknown; approvalId?: string }
@@ -138,7 +141,7 @@ export function normalize(raw: unknown): AgentItem[] {
         const name = String(block.name ?? 'tool')
         items.push({
           kind: 'tool',
-          id: String(block.id ?? ''),
+          toolId: String(block.id ?? ''),
           name,
           input: block.input,
           summary: toolSummary(name, block.input),

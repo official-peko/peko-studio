@@ -3,27 +3,54 @@
 // ide.agent:event push channel; input is sent back as newline-delimited JSON.
 import { peko } from '@peko/client'
 
+/// One CLI's availability, as reported by the host probing it with --version.
+export interface ProviderStatus {
+  id: string
+  available: boolean
+  version?: string
+  session?: 'persistent' | 'oneshot'
+}
+
 export interface AgentStatus {
   available: boolean
   version?: string
+  providers?: ProviderStatus[]
 }
 
-/// Whether the agent CLI is installed and reachable, plus its version string.
+/// Which agent CLIs are installed and reachable. `providers` lists every one the
+/// host knows about; `available` refers to the default (Claude Code) so an older
+/// panel keeps working.
 export async function agentStatus(): Promise<AgentStatus> {
   try {
     const result = (await peko.invoke('ide.agent.status', {})) as AgentStatus
-    return { available: result.available === true, version: result.version }
+    return {
+      available: result.available === true,
+      version: result.version,
+      providers: Array.isArray(result.providers) ? result.providers : undefined,
+    }
   } catch {
     return { available: false }
   }
 }
 
-/// Start (or restart) the agent session in the workspace with a permission mode.
-/// A non-empty `resume` continues a prior Claude session by id. Resolves true on
-/// success. Events then arrive on the ide.agent:event channel.
-export async function agentStart(mode = 'default', resume = ''): Promise<boolean> {
+/// Start (or restart) the agent session in the workspace with a permission mode
+/// and provider. A non-empty `resume` continues a prior session by id. For a
+/// one-shot provider this only records the choice; the first message starts the
+/// first turn. Events arrive on the ide.agent:event channel.
+export async function agentStart(mode = 'default', resume = '', provider = 'claude'): Promise<boolean> {
   try {
-    const result = (await peko.invoke('ide.agent.start', { mode, resume })) as { ok?: boolean }
+    const result = (await peko.invoke('ide.agent.start', { mode, resume, provider })) as { ok?: boolean }
+    return result.ok === true
+  } catch {
+    return false
+  }
+}
+
+/// Run one turn of a one-shot provider with `text` as the prompt. `resume` is
+/// the session id seen in the previous turn, which is what continues the thread.
+export async function agentSend(text: string, mode: string, resume = ''): Promise<boolean> {
+  try {
+    const result = (await peko.invoke('ide.agent.send', { text, mode, resume })) as { ok?: boolean }
     return result.ok === true
   } catch {
     return false

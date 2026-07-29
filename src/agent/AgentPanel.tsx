@@ -17,6 +17,7 @@ import {
   agentStart,
   agentStop,
   agentInput,
+  agentSend,
   agentApprove,
   onAgentEvent,
   threadsGet,
@@ -24,12 +25,12 @@ import {
   type AgentStatus,
 } from './agent'
 import {
-  normalize,
   userMessageLine,
   permissionResponseLine,
   type AgentItem,
   type PermissionMode,
 } from './protocol'
+import { PROVIDERS, providerById, normalizeFor, type ProviderId } from './providers'
 import { installAgentPlugin } from './plugin'
 import { projectSources } from '../ide/workspace'
 
@@ -102,12 +103,21 @@ const MODES: { value: PermissionMode; label: string }[] = [
   { value: 'plan', label: 'Plan only' },
 ]
 
+// Only Claude Code hands back individual actions for an inline decision. The
+// other CLIs enforce their own policy for the whole run, so their mode list is
+// narrower and "ask" is not offered.
+function modesFor(provider: ProviderId): { value: PermissionMode; label: string }[] {
+  const allowed = providerById(provider).modes
+  return MODES.filter((m) => allowed.includes(m.value))
+}
+
 export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (path: string) => void }) {
   const [status, setStatus] = useState<AgentStatus | null>(null)
   const [running, setRunning] = useState(false)
   const [busy, setBusy] = useState(false)
   const [model, setModel] = useState<string>()
   const [mode, setMode] = useState<PermissionMode>('ask')
+  const [provider, setProvider] = useState<ProviderId>('claude')
   const [threads, setThreads] = useState<Thread[]>([])
   const [activeId, setActiveId] = useState('')
   const [threadMenu, setThreadMenu] = useState(false)
@@ -129,6 +139,13 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
   useEffect(() => {
     modeRef.current = mode
   }, [mode])
+
+  // The event handler is mounted once, so the adapter it dispatches through has
+  // to be reachable by ref rather than by closure capture.
+  const providerRef = useRef(provider)
+  useEffect(() => {
+    providerRef.current = provider
+  }, [provider])
 
   const active = threads.find((t) => t.id === activeId) ?? null
   const transcript = active?.transcript ?? EMPTY
@@ -202,7 +219,7 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
   // resuming the thread later.
   useEffect(() => {
     const off = onAgentEvent((raw) => {
-      for (const item of normalize(raw)) {
+      for (const item of normalizeFor(providerRef.current, raw)) {
         switch (item.kind) {
           case 'system':
             if (item.model) setModel(item.model)
@@ -257,7 +274,12 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
           case 'exit':
             setRunning(false)
             setBusy(false)
-            append(item)
+            // A one-shot provider exits at the end of every turn, so an exit is
+            // only worth reporting when it ends a persistent session or when it
+            // failed. Otherwise each message would leave a "session ended" note.
+            if (providerById(providerRef.current).session === 'persistent' || item.code !== 0) {
+              append(item)
+            }
             break
           default:
             append(item)
@@ -353,7 +375,7 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
       return
     }
     if (!running) {
-      const ok = await agentStart(mode, active?.sessionId ?? '')
+      const ok = await agentStart(mode, active?.sessionId ?? '', provider)
       setRunning(ok)
       if (!ok) {
         append({ kind: 'error', text: 'Could not start the agent.' })
@@ -369,7 +391,18 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
     append({ kind: 'user', text })
     setBusy(true)
     setInput('')
-    await agentInput(userMessageLine(text))
+    // A persistent session takes the message on stdin. A one-shot provider has
+    // no process between turns, so the message spawns one, carrying the session
+    // id from the previous turn to continue the thread.
+    if (providerById(provider).session === 'persistent') {
+      await agentInput(userMessageLine(text))
+    } else {
+      const ok = await agentSend(text, mode, active?.sessionId ?? '')
+      if (!ok) {
+        setBusy(false)
+        append({ kind: 'error', text: `Could not run ${providerById(provider).label}.` })
+      }
+    }
   }
 
   const decide = async (entryId: number, requestId: string, allow: boolean, approvalId?: string) => {
@@ -429,14 +462,38 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
 
   const modeLabel = useMemo(() => MODES.find((m) => m.value === mode)?.label, [mode])
 
-  if (status && !status.available) {
+  // Offer only CLIs the host found installed. An older host that reports no
+  // provider list is treated as Claude-only, which is what it supported.
+  const installed = useMemo(() => {
+    const list = status?.providers
+    if (!list) return status?.available ? PROVIDERS.filter((p) => p.id === 'claude') : []
+    return PROVIDERS.filter((p) => list.some((s) => s.id === p.id && s.available))
+  }, [status])
+
+  // Keep the selection on something that exists.
+  useEffect(() => {
+    if (installed.length > 0 && !installed.some((p) => p.id === provider)) {
+      const next = installed[0]
+      setProvider(next.id)
+      if (!next.modes.includes(mode)) setMode(next.modes[0] as PermissionMode)
+    }
+  }, [installed, provider, mode])
+
+  if (status && installed.length === 0) {
     return (
       <div className="agent-panel">
         <div className="agent-empty">
-          <p>Claude Code was not found.</p>
+          <p>No agent CLI was found.</p>
           <p className="agent-empty-hint">
-            Install it and make sure <code>claude</code> is on your PATH, then reopen this panel.
+            Install one and make sure it is on your PATH, then reopen this panel.
           </p>
+          <ul className="agent-empty-list">
+            {PROVIDERS.map((p) => (
+              <li key={p.id}>
+                {p.label}: <code>{p.install}</code>
+              </li>
+            ))}
+          </ul>
           <button type="button" onClick={() => void agentStatus().then(setStatus)}>
             Retry
           </button>
@@ -448,16 +505,34 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
   return (
     <div className="agent-panel">
       <div className="agent-head">
-        <span className="agent-title">Assistant</span>
+        <span className="agent-title">Agent</span>
         {model && <span className="agent-model">{model}</span>}
         <span className="agent-head-spacer" />
+        {installed.length > 1 && (
+          <select
+            className="agent-mode"
+            value={provider}
+            title="Agent CLI (applies to the next session)"
+            onChange={(e) => {
+              const next = providerById(e.target.value)
+              setProvider(next.id)
+              if (!next.modes.includes(mode)) setMode(next.modes[0] as PermissionMode)
+            }}
+          >
+            {installed.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        )}
         <select
           className="agent-mode"
           value={mode}
           title="Permission mode (applies to the next session)"
           onChange={(e) => setMode(e.target.value as PermissionMode)}
         >
-          {MODES.map((m) => (
+          {modesFor(provider).map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
             </option>
@@ -504,7 +579,7 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
       <div className="agent-transcript" ref={scrollRef} onScroll={onTranscriptScroll}>
         {transcript.length === 0 && (
           <div className="agent-hello">
-            Ask the assistant to build, refactor, or explain. It works directly in{' '}
+            Ask the agent to build, refactor, or explain. It works directly in{' '}
             {root.split('/').pop()}. Use <b>@</b> to reference files. Permission mode: <b>{modeLabel}</b>.
           </div>
         )}
@@ -538,7 +613,7 @@ export function AgentPanel({ root, onOpenFile }: { root: string; onOpenFile: (pa
           className="agent-input"
           value={input}
           rows={3}
-          placeholder="Ask the assistant... (@ for files, / for commands)"
+          placeholder="Ask the agent... (@ for files, / for commands)"
           onChange={(e) => {
             setInput(e.target.value)
             updateMenu(e.target.value, e.target.selectionStart ?? e.target.value.length)
@@ -669,7 +744,11 @@ function TranscriptRow({
     case 'error':
       return <div className="agent-log error">{entry.text}</div>
     case 'exit':
-      return <div className="agent-log">Session ended (exit {entry.code}).</div>
+      return (
+        <div className={`agent-log${entry.code === 0 ? '' : ' error'}`}>
+          {entry.code === 0 ? 'Session ended.' : `Session ended (exit ${entry.code}).`}
+        </div>
+      )
     default:
       return null
   }

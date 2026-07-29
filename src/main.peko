@@ -41,15 +41,31 @@ class RunHolder {
 
 let g_run: RunHolder = new RunHolder();
 
+/// Holds the running `peko deploy` process so ide.deploy.stop can terminate it.
+/// A deploy builds every target platform and can run for minutes, so it must be
+/// interruptible from the panel rather than only by closing the IDE.
+class DeployHolder {
+	[mutates] child: process::Process?;
+	constructor() {
+		this.child = None;
+	}
+}
+
+let g_deploy: DeployHolder = new DeployHolder();
+
 /// Holds the running agent CLI (Claude Code) process so its input and lifecycle
 /// can be driven from the chat panel. The generation counter identifies the
 /// current session; the approval-watcher thread exits when it changes.
 class AgentHolder {
 	[mutates] child: process::Process?;
 	[mutates] generation: number;
+	/// The provider id the current session runs, which decides both the binary
+	/// and whether a message is written to stdin or spawns a fresh turn.
+	[mutates] provider: string;
 	constructor() {
 		this.child = None;
 		this.generation = 0;
+		this.provider = "claude";
 	}
 }
 
@@ -380,6 +396,25 @@ fn spawn_peko_in(args: Array<string>, dir: string) => process::Process? {
 	return process::spawn_in("/usr/bin/env", env_args, dir);
 }
 
+/// Run `peko <args> --json` and return its single JSON object as a reply body.
+///
+/// The CLI's stdout is untrusted here: a stray line from a subprocess, or a
+/// command that fails before printing, would otherwise be spliced verbatim into
+/// the bridge reply and tear down the webview with a parse error. Parsing and
+/// re-serializing guarantees a well-formed object, and anything that is not one
+/// degrades to an empty object the caller can treat as "unavailable".
+fn capture_peko_object(args: Array<string>) => string {
+	let output: string = run_peko_capture(args);
+	if output.size() == 0 {
+		return `{}`;
+	}
+	let parsed: json::JsonValue = json::parse(output);
+	if parsed.kind() != "object" {
+		return `{}`;
+	}
+	return parsed.to_string();
+}
+
 /// Run `peko <args>` in the workspace and return its stdout (lines joined). Used
 /// for the short, machine-readable `peko keys` commands.
 fn run_peko_capture(args: Array<string>) => string {
@@ -391,7 +426,15 @@ fn run_peko_capture(args: Array<string>) => string {
 	let out: string = "";
 	let line: string? = child.read_line();
 	while line.is_value() {
-		out = `${out}${line.unwrap()}`;
+		// Keep the line breaks. In --json mode the CLI emits one object per
+		// line, and joining them with nothing produces `{...}{...}`, a single
+		// unparseable run that callers display raw. A single-value reply is
+		// unaffected: the parser reads the first value and ignores the rest.
+		if out.size() > 0 {
+			out = `${out}\n${line.unwrap()}`;
+		} else {
+			out = line.unwrap();
+		}
 		line = child.read_line();
 	}
 	child.wait();
@@ -927,8 +970,60 @@ fn threads_file() => string {
 }
 
 /// The agent CLI command. The chat panel is a thin wrapper over this tool.
-fn agent_command() => string {
+fn agent_command(provider: string) => string {
+	if provider == "codex" {
+		return "codex";
+	}
+	if provider == "gemini" {
+		return "gemini";
+	}
+	if provider == "opencode" {
+		return "opencode";
+	}
+	if provider == "aider" {
+		return "aider";
+	}
 	return "claude";
+}
+
+/// Join `parts` with `separator`.
+fn join_strings(parts: Array<string>, separator: string) => string {
+	let out: string = "";
+	let index: number = 0;
+	let one: number = 1;
+	while index < parts.size() {
+		if index > 0 {
+			out = `${out}${separator}`;
+		}
+		out = `${out}${parts[index]}`;
+		index = index + one;
+	}
+	return out;
+}
+
+/// Every provider the panel can offer, so status can report which are installed.
+fn agent_providers() => Array<string> {
+	let ids: Array<string> = new Array<string>();
+	ids.push("claude");
+	ids.push("codex");
+	ids.push("gemini");
+	ids.push("opencode");
+	ids.push("aider");
+	return ids;
+}
+
+/// How a provider carries a conversation.
+///
+/// Claude Code holds one process open and takes further messages on stdin, so a
+/// session is a single long-lived child. The others run one turn per process and
+/// continue by being handed the previous session id, so each message spawns a
+/// fresh child. The panel needs this to know whether to write to stdin or ask for
+/// another spawn.
+fn agent_session_model(provider: string) => string {
+	if provider == "claude" || provider.size() == 0 {
+		return "persistent";
+	}
+	return "oneshot";
 }
 
 /// The directory holding Peko Studio state under HOME.
@@ -954,11 +1049,29 @@ fn approvals_dir() => string {
 	return `${studio_dir()}/approvals`;
 }
 
-/// The IDE-owned Claude Code plugin directory. It holds the Peko development
-/// skill and is passed to the agent CLI as a session plugin dir, so the skill is
-/// available without touching the user's project or global config.
+/// The IDE-owned Claude Code plugin directory. It holds the Peko skills and is
+/// passed to the agent CLI as a session plugin dir, so they are available
+/// without touching the user's project or global config.
 fn agent_plugin_dir() => string {
 	return `${studio_dir()}/agent-plugin`;
+}
+
+/// Create every directory leading to `relative` under `root`. fs::make_dir makes
+/// one level, so each segment before the file name is made in turn. A path with
+/// no separator has no parents to make and does nothing.
+fn make_parent_dirs(root: string, relative: string) {
+	let remaining: string = relative;
+	let built: string = root;
+	let zero: number = 0;
+	let one: number = 1;
+	let separator: number = remaining.index_of("/");
+	while separator >= zero {
+		let segment: string = remaining.substring(0, separator);
+		built = `${built}/${segment}`;
+		fs::make_dir(built);
+		remaining = remaining.substring(separator + one, remaining.size());
+		separator = remaining.index_of("/");
+	}
 }
 
 /// The cached platform identity. The chip reads this on startup so the common
@@ -1199,6 +1312,84 @@ fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: stri
 		args.push("--resume");
 		args.push(resume);
 	}
+	return args;
+}
+
+/// The arguments for one turn of a one-shot provider.
+///
+/// These CLIs run a single turn per process and continue a conversation by being
+/// handed the previous session id, so the prompt is an argument rather than a
+/// line written to stdin. Each maps the panel's permission mode onto whatever
+/// approval control it actually offers, which is coarser than Claude Code's.
+fn agent_turn_args(provider: string, mode: string, resume: string, prompt: string) => Array<string> {
+	let args: Array<string> = new Array<string>();
+
+	if provider == "codex" {
+		args.push("exec");
+		if resume.size() > 0 {
+			args.push("resume");
+			args.push(resume);
+		}
+		args.push("--json");
+		// Codex refuses to run outside a git repository without this, which a
+		// scratch project often is.
+		args.push("--skip-git-repo-check");
+		if mode == "bypassPermissions" {
+			args.push("--dangerously-bypass-approvals-and-sandbox");
+		} else {
+			args.push("--sandbox");
+			if mode == "plan" {
+				args.push("read-only");
+			} else {
+				args.push("workspace-write");
+			}
+		}
+		args.push(prompt);
+		return args;
+	}
+
+	if provider == "gemini" {
+		args.push("--output-format");
+		args.push("json");
+		if mode == "bypassPermissions" {
+			args.push("--yolo");
+		} else if mode == "acceptEdits" {
+			args.push("--approval-mode");
+			args.push("auto_edit");
+		}
+		args.push("--prompt");
+		args.push(prompt);
+		return args;
+	}
+
+	if provider == "opencode" {
+		args.push("run");
+		args.push("--format");
+		args.push("json");
+		if resume.size() > 0 {
+			args.push("--session");
+			args.push(resume);
+		}
+		if mode == "bypassPermissions" {
+			args.push("--auto");
+		}
+		args.push(prompt);
+		return args;
+	}
+
+	if provider == "aider" {
+		// Aider emits plain text, not events. --yes keeps it non-interactive.
+		args.push("--no-pretty");
+		args.push("--no-stream");
+		if mode != "plan" {
+			args.push("--yes");
+		}
+		args.push("--message");
+		args.push(prompt);
+		return args;
+	}
+
+	args.push(prompt);
 	return args;
 }
 
@@ -1844,6 +2035,10 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let scope: string = opt_string(object, "global");
 			let args: Array<string> = new Array<string>();
 			args.push("remove");
+			// --json puts errors on stdout; in human mode they go to stderr,
+			// which run_peko_capture does not read, so a refusal looked like
+			// success and the panel silently kept the old key.
+			args.push("--json");
 			args.push(name);
 			if scope == "true" {
 				args.push("--global");
@@ -2268,25 +2463,54 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 		},
 	);
 
-	// ide.agent.status reports whether the agent CLI is installed and reachable,
-	// by running it with --version. Reply: {available, version?}.
+	// ide.agent.status probes every known provider with --version and reports
+	// which are installed, so the panel offers only CLIs the user actually has.
+	// `available` stays for the default provider so an older panel still works.
+	// Reply: {available, version?, providers:[{id, available, version, session}]}.
 	application.on(
 		"ide.agent.status",
 		closure(params: string) => string {
-			let version_args: Array<string> = new Array<string>();
-			version_args.push("--version");
-			let spawned: process::Process? = spawn_agent_in(agent_command(), version_args, WORKSPACE_ROOT);
-			if !spawned.is_value() {
-				return `{"available":false}`;
+			let ids: Array<string> = agent_providers();
+			let entries: Array<string> = new Array<string>();
+			let default_available: bool = false;
+			let default_version: string = "";
+			let index: number = 0;
+			let one: number = 1;
+			while index < ids.size() {
+				let id: string = ids[index];
+				let version_args: Array<string> = new Array<string>();
+				version_args.push("--version");
+				let spawned: process::Process? = spawn_agent_in(
+					agent_command(id),
+					version_args,
+					WORKSPACE_ROOT,
+				);
+				let available: bool = false;
+				let version: string = "";
+				if spawned.is_value() {
+					let child: process::Process = spawned.unwrap();
+					let line: string? = child.read_line();
+					child.wait();
+					if line.is_value() {
+						available = true;
+						version = line.unwrap();
+					}
+				}
+				let id_json: string = new json::JsonString(id).to_string();
+				let version_json: string = new json::JsonString(version).to_string();
+				let session_json: string = new json::JsonString(agent_session_model(id)).to_string();
+				entries.push(
+					`{"id":${id_json},"available":${available},"version":${version_json},"session":${session_json}}`,
+				);
+				if id == "claude" {
+					default_available = available;
+					default_version = version;
+				}
+				index = index + one;
 			}
-			let child: process::Process = spawned.unwrap();
-			let line: string? = child.read_line();
-			child.wait();
-			if !line.is_value() {
-				return `{"available":false}`;
-			}
-			let version_json: string = new json::JsonString(line.unwrap()).to_string();
-			return `{"available":true,"version":${version_json}}`;
+			let joined: string = join_strings(entries, ",");
+			let default_json: string = new json::JsonString(default_version).to_string();
+			return `{"available":${default_available},"version":${default_json},"providers":[${joined}]}`;
 		},
 	);
 
@@ -2303,14 +2527,26 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let parsed: json::JsonValue = json::parse(params);
 			let mode: string = "ask";
 			let resume: string = "";
+			let provider: string = "claude";
 			if parsed.kind() == "object" {
 				let request: json::JsonObject = parsed as json::JsonObject;
 				mode = field_string(request, "mode");
 				resume = field_string(request, "resume");
+				let requested: string = field_string(request, "provider");
+				if requested.size() > 0 {
+					provider = requested;
+				}
 			}
+			g_agent.provider = provider;
 			// New session generation stops the previous approval watcher.
 			g_agent.generation = g_agent.generation + 1;
 			let generation: number = g_agent.generation;
+
+			// A one-shot provider has no process between turns. Starting a session
+			// only records the provider; the first message spawns the first turn.
+			if agent_session_model(provider) != "persistent" {
+				return `{"ok":true,"session":"oneshot"}`;
+			}
 			// Interactive modes route permissions through the approval server when
 			// node is available. Bypass and plan modes run without prompts.
 			let wants_prompts: bool = mode.size() == 0 || mode == "ask" || mode == "acceptEdits";
@@ -2324,7 +2560,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				plugin_dir = agent_plugin_dir();
 			}
 			let spawned: process::Process? = spawn_agent_in(
-				agent_command(),
+				agent_command(provider),
 				agent_args(mode, resume, mcp_config, plugin_dir),
 				WORKSPACE_ROOT,
 			);
@@ -2363,6 +2599,53 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				return `{"ok":false}`;
 			}
 			g_agent.child.unwrap().write_line(line);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.agent.send runs one turn of a one-shot provider: it spawns the CLI with
+	// the prompt as an argument and streams that process the same way a persistent
+	// session is streamed. The panel supplies the session id it saw in the last
+	// turn's events, which is what continues the conversation.
+	// Params: {text, mode, resume}. Reply: {ok}.
+	application.on(
+		"ide.agent.send",
+		closure[application](params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let text: string = field_string(request, "text");
+			if text.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let mode: string = field_string(request, "mode");
+			let resume: string = field_string(request, "resume");
+			let provider: string = g_agent.provider;
+			if provider.size() == 0 {
+				provider = "claude";
+			}
+			// A previous turn may still be running if the user sent again early.
+			if g_agent.child.is_value() {
+				g_agent.child.unwrap().kill();
+				g_agent.child = None;
+			}
+			let spawned: process::Process? = spawn_agent_in(
+				agent_command(provider),
+				agent_turn_args(provider, mode, resume, text),
+				WORKSPACE_ROOT,
+			);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.agent:event",
+					`{"t":"error","message":"could not launch the agent CLI (is it installed and on PATH?)"}`,
+				);
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			g_agent.child = child;
+			stream_agent(application, child);
 			return `{"ok":true}`;
 		},
 	);
@@ -2411,33 +2694,56 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 		},
 	);
 
-	// ide.agent.install_plugin writes the Peko development skill plugin into the
-	// IDE-owned plugin directory. The panel sends the skill and manifest text.
-	// Params: {skill, manifest}. Reply: {ok}.
+	// ide.agent.install_plugin writes the Peko skill plugin into the IDE-owned
+	// plugin directory. The panel sends every file as a path relative to the
+	// plugin root plus its text, so skills and their reference files travel
+	// together and adding one needs no change here.
+	// Params: {files: [{path, content}]}. Reply: {ok, written}.
 	application.on(
 		"ide.agent.install_plugin",
 		closure(params: string) => string {
 			let parsed: json::JsonValue = json::parse(params);
 			if parsed.kind() != "object" {
-				return `{"ok":false}`;
+				return `{"ok":false,"written":0}`;
 			}
 			let request: json::JsonObject = parsed as json::JsonObject;
-			let skill: string = field_string(request, "skill");
-			let manifest: string = field_string(request, "manifest");
-			if skill.size() == 0 || manifest.size() == 0 {
-				return `{"ok":false}`;
+			let listed: json::JsonValue? = request.get("files");
+			if !listed.is_value() {
+				return `{"ok":false,"written":0}`;
+			}
+			let raw: json::JsonValue = listed.unwrap();
+			if raw.kind() != "array" {
+				return `{"ok":false,"written":0}`;
 			}
 			let root: string = agent_plugin_dir();
 			fs::make_dir(root);
-			fs::make_dir(`${root}/.claude-plugin`);
-			fs::make_dir(`${root}/skills`);
-			fs::make_dir(`${root}/skills/peko-development`);
-			let wrote_manifest: bool = fs::write_file(`${root}/.claude-plugin/plugin.json`, manifest);
-			let wrote_skill: bool = fs::write_file(`${root}/skills/peko-development/SKILL.md`, skill);
-			if wrote_manifest && wrote_skill {
-				return `{"ok":true}`;
+
+			let files: json::JsonArray = raw as json::JsonArray;
+			let count: number = files.size();
+			let index: number = 0;
+			let written: number = 0;
+			let one: number = 1;
+			while index < count {
+				let entry: json::JsonValue = files.at(index);
+				if entry.kind() == "object" {
+					let file: json::JsonObject = entry as json::JsonObject;
+					let path: string = field_string(file, "path");
+					let content: string = field_string(file, "content");
+					// An empty path would write the directory itself, and empty
+					// content means the import produced nothing worth shipping.
+					if path.size() > 0 && content.size() > 0 {
+						make_parent_dirs(root, path);
+						if fs::write_file(`${root}/${path}`, content) {
+							written = written + one;
+						}
+					}
+				}
+				index = index + one;
 			}
-			return `{"ok":false}`;
+			if written == count {
+				return `{"ok":true,"written":${written}}`;
+			}
+			return `{"ok":false,"written":${written}}`;
 		},
 	);
 
@@ -2782,6 +3088,276 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			g_signing.reports = reports;
 			g_signing.valid = true;
 			return `{"reports":${reports}}`;
+		},
+	);
+
+	// ide.keys.generate creates signing material rather than registering material
+	// the user already has. Android produces an upload keystore with the bundled
+	// JDK; apple produces a key and a certificate request to upload to the
+	// developer portal. Both work from any host, so a Windows or Linux developer
+	// can obtain Apple signing material without a Mac.
+	// Params: {platform, password?, email?, name?, country?}. Reply: {ok, error?}.
+	application.on(
+		"ide.keys.generate",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let platform_id: string = field_string(request, "platform");
+			if platform_id.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("generate");
+			// --json puts errors on stdout; in human mode they go to stderr,
+			// which run_peko_capture does not read, so a refusal looked like
+			// success and the panel silently kept the old key.
+			args.push("--json");
+			args.push("--platform");
+			args.push(platform_id);
+			let password: string = field_string(request, "password");
+			if password.size() > 0 {
+				args.push("--password");
+				args.push(password);
+			}
+			let email: string = field_string(request, "email");
+			if email.size() > 0 {
+				args.push("--email");
+				args.push(email);
+			}
+			let display_name: string = field_string(request, "name");
+			if display_name.size() > 0 {
+				args.push("--name");
+				args.push(display_name);
+			}
+			let country: string = field_string(request, "country");
+			if country.size() > 0 {
+				args.push("--country");
+				args.push(country);
+			}
+			let output: string = run_peko_capture(args);
+			g_signing.valid = false;
+			let output_json: string = new json::JsonString(output).to_string();
+			return `{"ok":true,"output":${output_json}}`;
+		},
+	);
+
+	// ide.keys.remove deletes a platform's signing material: the key files, the
+	// registry entry, and the stored passwords. Destructive and not recoverable
+	// from here, so the panel confirms first. "apple" removes the key and
+	// certificate request shared by ios and macos, which is what has to go before
+	// the Apple flow can be started again.
+	// Params: {platform}. Reply: {ok, output}.
+	application.on(
+		"ide.keys.remove",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let platform_id: string = field_string(request, "platform");
+			if platform_id.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("remove");
+			args.push("--platform");
+			args.push(platform_id);
+			let output: string = run_peko_capture(args);
+			g_signing.valid = false;
+			let output_json: string = new json::JsonString(output).to_string();
+			// The generated request is only useful if the user can get at it, so
+			// hand back where it landed for the panel to reveal.
+			let dir: string = `${WORKSPACE_ROOT}/.peko/keys/apple`;
+			let csr: string = `${dir}/apple-signing-request.certSigningRequest`;
+			let csr_json: string = new json::JsonString(csr).to_string();
+			return `{"ok":true,"output":${output_json},"csr":${csr_json}}`;
+		},
+	);
+
+	// ide.keys.p12 pairs the certificate Apple issued with the key kept from the
+	// signing request, producing the .p12 the bundler signs with. The CLI checks
+	// the certificate actually matches that key, so a mismatched download fails
+	// here rather than part way through a release build.
+	// Params: {platform, cer, password, installer?}. Reply: {ok, output}.
+	application.on(
+		"ide.keys.p12",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let platform_id: string = field_string(request, "platform");
+			let cer: string = field_string(request, "cer");
+			let password: string = field_string(request, "password");
+			if platform_id.size() == 0 || cer.size() == 0 || password.size() == 0 {
+				return `{"ok":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("p12");
+			// --json puts errors on stdout; in human mode they go to stderr,
+			// which run_peko_capture does not read, so a refusal looked like
+			// success and the panel silently kept the old key.
+			args.push("--json");
+			args.push("--platform");
+			args.push(platform_id);
+			args.push("--cer");
+			args.push(cer);
+			args.push("--password");
+			args.push(password);
+			let installer: string = field_string(request, "installer");
+			if installer == "true" {
+				args.push("--installer");
+			}
+			let output: string = run_peko_capture(args);
+			g_signing.valid = false;
+			let output_json: string = new json::JsonString(output).to_string();
+			return `{"ok":true,"output":${output_json}}`;
+		},
+	);
+
+	// ide.apps.list reports the platform apps this account owns, for the picker
+	// shown when a project is not yet linked. Signing out is a normal result:
+	// the CLI replies {authenticated:false} rather than failing, so the panel
+	// renders a sign-in prompt instead of an error.
+	// Reply: the CLI's object, or {authenticated:false} when it cannot be read.
+	application.on(
+		"ide.apps.list",
+		closure(params: string) => string {
+			let args: Array<string> = new Array<string>();
+			args.push("apps");
+			args.push("list");
+			args.push("--json");
+			return capture_peko_object(args);
+		},
+	);
+
+	// ide.apps.current reports whether this project is linked and to which app
+	// id, read from peko.toml. Local only; no session needed.
+	// Reply: {linked, appId}.
+	application.on(
+		"ide.apps.current",
+		closure(params: string) => string {
+			let args: Array<string> = new Array<string>();
+			args.push("link");
+			args.push("--json");
+			return capture_peko_object(args);
+		},
+	);
+
+	// ide.apps.show resolves a linked app id to its name and capabilities, so a
+	// linked project can show what it is linked to. The CLI distinguishes an app
+	// that no longer exists from one owned by another account, reporting
+	// {app:null, reason} rather than an error, so the panel can offer the right
+	// remedy. Params: {appId}. Reply: the CLI's object.
+	application.on(
+		"ide.apps.show",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"app":null}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let app_id: string = field_string(request, "appId");
+			if app_id.size() == 0 {
+				return `{"app":null}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("apps");
+			args.push("show");
+			args.push(app_id);
+			args.push("--json");
+			return capture_peko_object(args);
+		},
+	);
+
+	// ide.apps.link points this project at an app id, writing app_id into
+	// peko.toml. Params: {appId}. Reply: {linked, appId}.
+	application.on(
+		"ide.apps.link",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"linked":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let app_id: string = field_string(request, "appId");
+			if app_id.size() == 0 {
+				return `{"linked":false}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("link");
+			args.push(app_id);
+			args.push("--json");
+			return capture_peko_object(args);
+		},
+	);
+
+	// ide.deploy.start runs a deploy, streaming its output to the panel. `kind`
+	// is "server" (the SSR backend) or "app" (native binaries). --json makes the
+	// CLI emit one event per line, ending with a `result` object carrying the
+	// outcome; --yes skips the prompts, which no one can answer from a panel.
+	// Params: {kind}. Reply: {ok}.
+	application.on(
+		"ide.deploy.start",
+		closure[application](params: string) => string {
+			if g_deploy.child.is_value() {
+				return `{"ok":false,"reason":"busy"}`;
+			}
+			let kind: string = "server";
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() == "object" {
+				let request: json::JsonObject = parsed as json::JsonObject;
+				let requested: string = field_string(request, "kind");
+				if requested == "app" {
+					kind = "app";
+				}
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("deploy");
+			args.push(kind);
+			args.push("--json");
+			args.push("--yes");
+			application.emit("ide.deploy:event", `{"t":"status","state":"deploying"}`);
+			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
+			if !spawned.is_value() {
+				application.emit(
+					"ide.deploy:event",
+					`{"t":"output","stream":"stderr","text":"could not launch peko deploy"}`,
+				);
+				application.emit("ide.deploy:event", `{"t":"status","state":"idle"}`);
+				return `{"ok":false}`;
+			}
+			let child: process::Process = spawned.unwrap();
+			g_deploy.child = child;
+			stream_process(application, child, "ide.deploy:event", `peko deploy ${kind}`);
+			return `{"ok":true}`;
+		},
+	);
+
+	// ide.deploy.stop terminates a running deploy. Reply: {ok}.
+	application.on(
+		"ide.deploy.stop",
+		closure[application](params: string) => string {
+			if !g_deploy.child.is_value() {
+				return `{"ok":false}`;
+			}
+			let child: process::Process = g_deploy.child.unwrap();
+			child.kill();
+			g_deploy.child = None;
+			application.emit(
+				"ide.deploy:event",
+				`{"t":"output","stream":"stderr","text":"deploy cancelled"}`,
+			);
+			application.emit("ide.deploy:event", `{"t":"status","state":"idle"}`);
+			return `{"ok":true}`;
 		},
 	);
 

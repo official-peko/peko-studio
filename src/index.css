@@ -1,3 +1,73 @@
+.signing-pane {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.signing-pane-head {
+  /* Never compressed: the title says which mode the pane is in. */
+  flex: 0 0 auto;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.signing-pane-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.signing-pane-head p {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  max-width: 64ch;
+}
+.signing-pane-body {
+  /* Grows to fill spare height, which pushes the actions to the bottom of a
+     tall panel. Crucially it does not shrink: when the panel is short, the body
+     keeps its natural height instead of compressing, so the actions fall below
+     the fold and scroll like any other content rather than covering it. */
+  flex: 1 0 auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-start;
+  min-height: 0;
+}
+.signing-pane-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  /* A little air above it once it is scrolling with the content, so it does not
+     butt up against the last field. */
+  margin-top: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+}
+.signing-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.7;
+  max-width: 64ch;
+}
+.signing-chosen {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 12px;
+  width: 100%;
+  max-width: 480px;
+}
 /* Peko Dark is the default; other themes override these via data-theme. */
 :root {
   --bg: #1b1b1f;
@@ -1762,7 +1832,6 @@ body {
 }
 .log-line.stderr { color: #f85149; }
 
-.console-line { white-space: pre-wrap; word-break: break-word; }
 .console-line.warn { color: #d29922; }
 .console-line.error { color: #f85149; }
 .console-line.debug { color: var(--muted); }
@@ -2764,11 +2833,6 @@ button.signing-dropzone:hover {
 .settings-editraw:hover { background: var(--hover); border-color: var(--accent); }
 
 /* The settings gear reads as an icon, larger than the text toggles beside it. */
-.status-gear {
-  font-size: 17px;
-  line-height: 1;
-  padding: 2px 8px;
-}
 
 /* Clickable source locations in build/run output. */
 .log-loc {
@@ -3259,6 +3323,7 @@ button.signing-dropzone:hover {
 .agent-hello, .agent-empty { color: var(--muted); line-height: 1.5; }
 .agent-empty { padding: 24px; text-align: center; display: flex; flex-direction: column; gap: 8px; align-items: center; }
 .agent-empty code { background: var(--hover); padding: 1px 4px; border-radius: 4px; }
+.agent-empty-list { list-style: none; margin: 4px 0 0; padding: 0; text-align: left; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
 .agent-empty button {
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
   border-radius: 6px; padding: 6px 14px; cursor: pointer; margin-top: 6px;
@@ -3408,6 +3473,12 @@ button.signing-dropzone:hover {
   height: 100vh;
   background: var(--bg);
   color: var(--text);
+  /* The window is frameless and transparent, so the page draws its shape.
+     Without this the content filled square corners at the top while the bottom
+     followed the window, so the two ends did not match. */
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
 }
 .setup-window-bar {
   display: flex;
@@ -3632,4 +3703,502 @@ button.signing-dropzone:hover {
 .setup-install:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Deploy panel: link picker, capability-gated actions, and the streamed log. */
+.deploy-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.deploy-empty {
+  padding: 16px;
+  color: var(--muted);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+.deploy-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-app {
+  font-weight: 600;
+  font-size: 13px;
+}
+.deploy-caps,
+.deploy-app-caps {
+  font-size: 11px;
+  color: var(--muted);
+}
+.deploy-head .spacer {
+  flex: 1;
+}
+.deploy-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-actions .spacer {
+  flex: 1;
+}
+.deploy-primary,
+.deploy-stop,
+.deploy-clear,
+.deploy-refresh,
+.deploy-link-change {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.deploy-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+.deploy-primary:disabled,
+.deploy-clear:disabled,
+.deploy-refresh:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.deploy-stop {
+  border-color: #f85149;
+  color: #f85149;
+}
+.deploy-picker {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+}
+.deploy-app-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.deploy-app-list button {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.deploy-app-list button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.deploy-app-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+.deploy-gate,
+.deploy-error,
+.deploy-result {
+  font-size: 12px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-gate {
+  color: #d29922;
+}
+.deploy-error,
+.deploy-result.failed {
+  color: #f85149;
+}
+.deploy-result.ok {
+  color: #3fb950;
+}
+.deploy-log {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Signing: generate new key material from the panel. */
+.signing-generate-open {
+  margin: 0 10px 10px;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.signing-generate-open:hover {
+  border-color: var(--accent);
+}
+.signing-generate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+.signing-generate input {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+}
+.signing-generate-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.signing-generate-actions button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.signing-generate-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.signing-generate-hint,
+.signing-generate-note {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+.signing-status.optional,
+.signing-status.not_required {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+}
+.signing-generate-hint.warn {
+  color: #d29922;
+}
+.signing-remove {
+  margin: 0 10px 10px;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.signing-remove:hover {
+  border-color: #f85149;
+  color: #f85149;
+}
+.signing-remove-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+.signing-generate-note.failed {
+  color: #f85149;
+}
+.signing-generate-collapsed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+.signing-generate-collapsed .signing-generate-open {
+  margin: 0;
+  align-self: flex-start;
+}
+
+/* Signing tab: platform sub-tabs over a single-purpose body. */
+.signing-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.signing-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.signing-tab {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.signing-tab:hover {
+  color: inherit;
+}
+.signing-tab.active {
+  color: inherit;
+  background: var(--panel);
+  border-color: var(--border);
+}
+.signing-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d29922;
+  display: inline-block;
+}
+.signing-pane {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+.signing-lead,
+.signing-lead-row {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+}
+.signing-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+  max-width: 60ch;
+  line-height: 1.5;
+}
+.signing-sub.warn {
+  color: #d29922;
+}
+.signing-state {
+  font-size: 13px;
+  font-weight: 600;
+}
+.signing-state.missing,
+.signing-state.invalid {
+  color: #d29922;
+}
+.signing-state.valid {
+  color: #3fb950;
+}
+.signing-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.signing-files li {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 2px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 12px;
+}
+.signing-files li.bad {
+  border-color: #d29922;
+}
+.signing-file-role {
+  color: var(--muted);
+}
+.signing-file-name {
+  font-weight: 500;
+  word-break: break-all;
+}
+.signing-file-detail {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.signing-passwords {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.signing-password-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.signing-password-row input,
+.signing-form input {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+}
+.signing-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 420px;
+}
+.signing-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.signing-check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.signing-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.signing-actions button,
+.signing-password-row button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.signing-actions button:disabled,
+.signing-password-row button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.signing-danger:hover:not(:disabled) {
+  border-color: #f85149;
+  color: #f85149;
+}
+.signing-note {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+.signing-note.failed {
+  color: #f85149;
+}
+
+/* Signing forms: a defined block rather than loose inputs. */
+.signing-form {
+  width: 100%;
+  max-width: 480px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  gap: 10px;
+}
+.signing-form label {
+  gap: 5px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.signing-form input {
+  padding: 6px 9px;
+}
+.signing-form input:focus,
+.signing-password-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.signing-dropzone {
+  width: 100%;
+  max-width: 480px;
+  padding: 26px 16px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+.signing-dropzone:hover,
+.signing-dropzone.active {
+  border-color: var(--accent);
+  color: inherit;
+}
+.signing-pane-actions button {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.signing-pane-actions button:first-child {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+.signing-pane-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.signing-pane-actions .signing-danger:first-child {
+  background: transparent;
+  border-color: #f85149;
+  color: #f85149;
 }
