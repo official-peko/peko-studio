@@ -15,7 +15,7 @@ height = 800
 uses = ["storage", "assets", "menu"]
 
 [dependencies]
-pekoui = "0.1.1"
+pekoui = "0.1.6"
 
 [icon]
 source = "icon/appicon.png"
