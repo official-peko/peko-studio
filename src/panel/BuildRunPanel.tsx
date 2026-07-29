@@ -430,9 +430,11 @@ export function BuildRunPanel({
             signing={signing}
             refresh={async () => {
               try {
-                const res = (await peko.invoke('ide.signing.status', {})) as {
-                  reports?: PlatformSigning[]
-                }
+                // force: the host caches the verification, and a `peko keys`
+                // run in a terminal leaves that cache looking valid.
+                const res = (await peko.invoke('ide.signing.status', {
+                  force: 'true',
+                })) as { reports?: PlatformSigning[] }
                 setSigning(res.reports ?? [])
               } catch {
                 setSigning([])

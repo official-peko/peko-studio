@@ -3955,7 +3955,10 @@ button.signing-dropzone:hover {
   padding: 6px 8px 0;
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
+  align-items: center;
 }
+.signing-tabs-spacer { flex: 1; }
+.signing-refresh { color: var(--muted); }
 .signing-tab {
   font: inherit;
   font-size: 12px;

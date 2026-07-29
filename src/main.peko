@@ -1493,6 +1493,27 @@ fn git_entry_json(raw: string) => string {
 	return `{"path":${path_json},"status":"${status}"}`;
 }
 
+/// Writes base64 `data` to a file under the Studio directory and returns its
+/// path, or the empty string when it cannot be written.
+///
+/// A file chosen in the webview carries no filesystem path, so an upload
+/// crosses the bridge as bytes. Commands that read a path rather than stdin
+/// need those bytes back on disk first. The caller removes the file once the
+/// command has run, so signing material does not linger.
+fn stage_upload(data: string, name: string) => string {
+	let decoded: string? = crypto::from_base64(data);
+	if !decoded.is_value() {
+		return "";
+	}
+	let dir: string = `${studio_dir()}/uploads`;
+	fs::make_dir(dir);
+	let path: string = `${dir}/${name}`;
+	if !write_binary_file(path, decoded.unwrap()) {
+		return "";
+	}
+	return path;
+}
+
 /// Writes a binary string to disk byte-exact. The FileHandle write path carries
 /// the byte count, so embedded null bytes survive. Returns true on success.
 fn write_binary_file(path: string, bytes: string) => bool {
@@ -3060,7 +3081,15 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 	application.on(
 		"ide.signing.status",
 		closure(params: string) => string {
-			if g_signing.valid {
+			// `peko keys` run in a terminal changes the registry without Studio
+			// knowing, and nothing invalidates the cache in that case. A caller
+			// that suspects the registry moved asks for a fresh read.
+			let force: bool = false;
+			let parsed_request: json::JsonValue = json::parse(params);
+			if parsed_request.kind() == "object" {
+				force = field_string(parsed_request as json::JsonObject, "force") == "true";
+			}
+			if g_signing.valid && !force {
 				return `{"reports":${g_signing.reports}}`;
 			}
 			let args: Array<string> = new Array<string>();
@@ -3194,8 +3223,21 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			}
 			let request: json::JsonObject = parsed as json::JsonObject;
 			let platform_id: string = field_string(request, "platform");
-			let cer: string = field_string(request, "cer");
 			let password: string = field_string(request, "password");
+			// The panel sends the certificate's bytes, not a path: a webview
+			// File carries no filesystem path, so the browser side cannot name
+			// the file it just read. Stage the bytes and hand the CLI the
+			// staged path.
+			let data: string = field_string(request, "data");
+			let cer: string = field_string(request, "cer");
+			let staged: string = "";
+			if data.size() > 0 {
+				staged = stage_upload(data, "certificate.cer");
+				if staged.size() == 0 {
+					return `{"ok":false,"output":"could not stage the certificate"}`;
+				}
+				cer = staged;
+			}
 			if platform_id.size() == 0 || cer.size() == 0 || password.size() == 0 {
 				return `{"ok":false}`;
 			}
@@ -3217,6 +3259,50 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				args.push("--installer");
 			}
 			let output: string = run_peko_capture(args);
+			if staged.size() > 0 {
+				fs::remove(staged);
+			}
+			g_signing.valid = false;
+			let output_json: string = new json::JsonString(output).to_string();
+			return `{"ok":true,"output":${output_json}}`;
+		},
+	);
+
+	// ide.signing.notary registers the App Store Connect API key that notarizes
+	// a macOS release. The three values travel together because the CLI needs
+	// all of them at once, and the .p8 arrives as bytes for the same reason the
+	// certificate does. Params: {issuer, key_id, data}. Reply: {ok, output}.
+	application.on(
+		"ide.signing.notary",
+		closure(params: string) => string {
+			let parsed: json::JsonValue = json::parse(params);
+			if parsed.kind() != "object" {
+				return `{"ok":false}`;
+			}
+			let request: json::JsonObject = parsed as json::JsonObject;
+			let issuer: string = field_string(request, "issuer");
+			let key_id: string = field_string(request, "key_id");
+			let data: string = field_string(request, "data");
+			if issuer.size() == 0 || key_id.size() == 0 || data.size() == 0 {
+				return `{"ok":false,"output":"issuer, key id, and the .p8 are all required"}`;
+			}
+			let staged: string = stage_upload(data, "notary.p8");
+			if staged.size() == 0 {
+				return `{"ok":false,"output":"could not stage the notary key"}`;
+			}
+			let args: Array<string> = new Array<string>();
+			args.push("keys");
+			args.push("add");
+			args.push("--platform");
+			args.push("macos");
+			args.push("--notary-issuer");
+			args.push(issuer);
+			args.push("--notary-key-id");
+			args.push(key_id);
+			args.push("--notary-p8");
+			args.push(staged);
+			let output: string = run_peko_capture(args);
+			fs::remove(staged);
 			g_signing.valid = false;
 			let output_json: string = new json::JsonString(output).to_string();
 			return `{"ok":true,"output":${output_json}}`;

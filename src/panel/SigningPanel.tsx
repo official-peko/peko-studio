@@ -33,7 +33,7 @@ import {
 } from './signingShared'
 
 /// What the body of a platform tab is currently showing.
-type Mode = 'view' | 'add' | 'generate' | 'remove'
+type Mode = 'view' | 'add' | 'generate' | 'remove' | 'notary'
 
 export function SigningView({
   platforms,
@@ -49,6 +49,13 @@ export function SigningView({
 
   useEffect(() => {
     void refresh()
+    // Keys can also be changed from outside Studio, by running `peko keys` in a
+    // terminal. Nothing notifies the panel when that happens, so the registry
+    // is re-read whenever the window regains focus, and a manual control is
+    // offered for the case where the change happened without a focus change.
+    const onFocus = () => void refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -81,6 +88,15 @@ export function SigningView({
             </button>
           )
         })}
+        <span className="signing-tabs-spacer" />
+        <button
+          type="button"
+          className="signing-tab signing-refresh"
+          title="Re-read the key registry, after changing keys with the CLI"
+          onClick={() => void refresh()}
+        >
+          Refresh
+        </button>
       </div>
       <PlatformPane
         key={current}
@@ -165,6 +181,9 @@ function PlatformPane({
   if (mode === 'remove') {
     return <RemoveForm platform={platform} onDone={done} onCancel={() => setMode('view')} />
   }
+  if (mode === 'notary') {
+    return <NotaryForm onDone={done} onCancel={() => setMode('view')} />
+  }
 
   const registered = (report?.checks ?? []).filter((check) => check.file)
   const hasAnything = registered.length > 0
@@ -183,6 +202,11 @@ function PlatformPane({
           {GENERATABLE_PLATFORMS.includes(platform) && (
             <button type="button" onClick={() => setMode('generate')}>
               {platform === 'android' ? 'Create a keystore' : 'Create a signing request'}
+            </button>
+          )}
+          {platform === 'macos' && (
+            <button type="button" onClick={() => setMode('notary')}>
+              Notarization key
             </button>
           )}
           {hasAnything && (
@@ -523,15 +547,96 @@ function GenerateForm({
           accept=".cer"
           style={{ display: 'none' }}
           onChange={(e) => {
-            const file = e.target.files?.[0] as (File & { path?: string }) | undefined
-            // The CLI reads the certificate from disk, so the path crosses the
-            // bridge rather than the bytes.
-            if (file?.path) void run('ide.keys.p12', { platform, cer: file.path, password })
-            else if (file) setError('Could not read that file path. Use the CLI for this step.')
+            const file = e.target.files?.[0]
+            // A webview File carries no filesystem path, so the certificate
+            // crosses the bridge as bytes and the host stages it for the CLI.
+            if (file) {
+              void fileToBase64(file).then((data) =>
+                run('ide.keys.p12', { platform, data, password }),
+              )
+            }
             e.target.value = ''
           }}
         />
       )}
+    </Pane>
+  )
+}
+
+/// Registers the App Store Connect API key that notarizes a macOS release.
+///
+/// Notarization is separate from signing: a signed build still needs to be
+/// notarized before macOS will open it without a warning. The three values are
+/// collected together because the CLI takes them as a set.
+function NotaryForm({
+  onDone,
+  onCancel,
+}: {
+  onDone: (message: string | null, failed?: boolean) => Promise<void>
+  onCancel: () => void
+}) {
+  const [issuer, setIssuer] = useState('')
+  const [keyId, setKeyId] = useState('')
+  const [file, setFile] = useState<File | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async () => {
+    if (!issuer || !keyId || !file) return
+    setBusy(true)
+    setError(null)
+    try {
+      const data = await fileToBase64(file)
+      const result = (await peko.invoke('ide.signing.notary', {
+        issuer,
+        key_id: keyId,
+        data,
+      })) as { ok?: boolean; output?: string }
+      if (result?.ok) await onDone('Notarization key registered.')
+      else setError(result?.output || 'Could not register the notarization key.')
+    } catch {
+      setError('Could not register the notarization key.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Pane
+      title="Notarization key"
+      lead="Apple notarizes a macOS release before it will open without a warning. Create an App Store Connect API key with the Developer role, then register it here."
+      note={error ? { text: error, failed: true } : null}
+      actions={
+        <>
+          <button type="button" disabled={busy || !issuer || !keyId || !file} onClick={() => void submit()}>
+            {busy ? 'Working...' : 'Register key'}
+          </button>
+          <button type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </>
+      }
+    >
+      <ol className="signing-steps">
+        <li>Open App Store Connect, Users and Access, then Integrations.</li>
+        <li>Create a key with the Developer role and download the .p8 once.</li>
+        <li>Copy the Issuer ID and the Key ID from that page.</li>
+      </ol>
+
+      <div className="signing-form">
+        <label>
+          Issuer ID
+          <input value={issuer} onChange={(e) => setIssuer(e.target.value)} placeholder="00000000-0000-0000-0000-000000000000" />
+        </label>
+        <label>
+          Key ID
+          <input value={keyId} onChange={(e) => setKeyId(e.target.value)} placeholder="ABCD1234EF" />
+        </label>
+        <label>
+          The .p8 key file
+          <input type="file" accept=".p8" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+        </label>
+      </div>
     </Pane>
   )
 }
