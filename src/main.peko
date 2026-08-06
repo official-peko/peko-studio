@@ -875,10 +875,7 @@ fn run_setup_flow(application: ui::app::App, args: Array<string>, dir: string) {
 			// first; fall back to an installed peko only if the download fails.
 			// Running on this background thread keeps the bridge free so progress
 			// streams live instead of blocking behind the download.
-			application.emit(
-				"ide.setup:event",
-				`{"type":"status","message":"downloading the Peko CLI"}`,
-			);
+			application.emit("ide.setup:event", `{"type":"status","message":"downloading the Peko CLI"}`);
 			let peko_path: string = bootstrap_peko();
 			if peko_path.size() == 0 {
 				peko_path = resolve_peko();
@@ -891,16 +888,10 @@ fn run_setup_flow(application: ui::app::App, args: Array<string>, dir: string) {
 					return;
 				}
 			}
-			application.emit(
-				"ide.setup:event",
-				`{"type":"status","message":"running the installer"}`,
-			);
+			application.emit("ide.setup:event", `{"type":"status","message":"running the installer"}`);
 			let spawned: process::Process? = process::spawn_in(peko_path, args, dir);
 			if !spawned.is_value() {
-				application.emit(
-					"ide.setup:event",
-					`{"type":"error","message":"could not launch peko setup"}`,
-				);
+				application.emit("ide.setup:event", `{"type":"error","message":"could not launch peko setup"}`);
 				application.emit("ide.setup:done", `{"code":1}`);
 				return;
 			}
@@ -2501,11 +2492,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				let id: string = ids[index];
 				let version_args: Array<string> = new Array<string>();
 				version_args.push("--version");
-				let spawned: process::Process? = spawn_agent_in(
-					agent_command(id),
-					version_args,
-					WORKSPACE_ROOT,
-				);
+				let spawned: process::Process? = spawn_agent_in(agent_command(id), version_args, WORKSPACE_ROOT);
 				let available: bool = false;
 				let version: string = "";
 				if spawned.is_value() {
