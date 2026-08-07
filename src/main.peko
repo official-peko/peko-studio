@@ -1032,12 +1032,18 @@ fn mcp_script_file() => string {
 	return `${studio_dir()}/mcp-approval.mjs`;
 }
 
+/// The config and the request/response exchange are keyed by workspace. Two
+/// Studio windows would otherwise share one exchange directory, and starting a
+/// session in either one resets it — discarding an action the other window was
+/// still waiting on the user to decide.
 fn mcp_config_file() => string {
-	return `${studio_dir()}/mcp-config.json`;
+	return `${studio_dir()}/mcp-${sanitize_key(WORKSPACE_ROOT)}.json`;
 }
 
 fn approvals_dir() => string {
-	return `${studio_dir()}/approvals`;
+	let dir: string = `${studio_dir()}/approvals`;
+	fs::make_dir(dir);
+	return `${dir}/${sanitize_key(WORKSPACE_ROOT)}`;
 }
 
 /// The IDE-owned Claude Code plugin directory. It holds the Peko skills and is
@@ -1175,7 +1181,7 @@ fn refresh_account_identity() => string {
 /// to write a decision file, and returns allow or deny. This is written to disk
 /// so the agent CLI can spawn it with node. The text avoids backticks and the
 /// dollar-brace sequence so it embeds cleanly in this template string.
-let MCP_APPROVAL_JS: string = `\nimport { createInterface } from 'node:readline'\nimport { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'\nimport { randomUUID } from 'node:crypto'\nimport { join } from 'node:path'\n\nconst DIR = process.env.PEKO_APPROVAL_DIR || '.'\nconst rl = createInterface({ input: process.stdin })\nconst send = (m) => process.stdout.write(JSON.stringify(m) + String.fromCharCode(10))\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms))\n\nasync function decide(args) {\n  const id = randomUUID()\n  const reqPath = join(DIR, 'req-' + id + '.json')\n  const resPath = join(DIR, 'res-' + id + '.json')\n  const input = args.input || {}\n  try {\n    writeFileSync(reqPath, JSON.stringify({ id, tool_name: args.tool_name || 'tool', input, tool_use_id: args.tool_use_id || '' }))\n  } catch (e) {\n    return { behavior: 'allow', updatedInput: input }\n  }\n  const deadline = Date.now() + 1800000\n  while (Date.now() < deadline) {\n    if (existsSync(resPath)) {\n      let decision = { behavior: 'deny', message: 'No decision.' }\n      try { decision = JSON.parse(readFileSync(resPath, 'utf8')) } catch (e) {}\n      try { rmSync(reqPath) } catch (e) {}\n      try { rmSync(resPath) } catch (e) {}\n      if (decision.behavior === 'allow') return { behavior: 'allow', updatedInput: input }\n      return { behavior: 'deny', message: decision.message || 'The user declined this action.' }\n    }\n    await sleep(120)\n  }\n  try { rmSync(reqPath) } catch (e) {}\n  return { behavior: 'deny', message: 'Approval timed out.' }\n}\n\nrl.on('line', async (line) => {\n  if (!line.trim()) return\n  let msg\n  try { msg = JSON.parse(line) } catch (e) { return }\n  const id = msg.id\n  const method = msg.method\n  if (method === 'initialize') {\n    send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'approval', version: '1.0.0' } } })\n  } else if (method === 'tools/list') {\n    send({ jsonrpc: '2.0', id, result: { tools: [{ name: 'approval_prompt', description: 'Ask the user to approve a tool action.', inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' } } } }] } })\n  } else if (method === 'tools/call') {\n    const decision = await decide((msg.params && msg.params.arguments) || {})\n    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(decision) }] } })\n  } else if (method === 'notifications/initialized') {\n    return\n  } else if (id !== undefined && id !== null) {\n    send({ jsonrpc: '2.0', id, result: {} })\n  }\n})\n`;
+let MCP_APPROVAL_JS: string = `\nimport { createInterface } from 'node:readline'\nimport { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'\nimport { randomUUID } from 'node:crypto'\nimport { join } from 'node:path'\n\nconst DIR = process.env.PEKO_APPROVAL_DIR || '.'\nconst rl = createInterface({ input: process.stdin })\nconst send = (m) => process.stdout.write(JSON.stringify(m) + String.fromCharCode(10))\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms))\n\nasync function decide(args) {\n  const id = randomUUID()\n  const reqPath = join(DIR, 'req-' + id + '.json')\n  const resPath = join(DIR, 'res-' + id + '.json')\n  const input = args.input || {}\n  try {\n    writeFileSync(reqPath, JSON.stringify({ id, tool_name: args.tool_name || 'tool', input, tool_use_id: args.tool_use_id || '' }))\n  } catch (e) {\n    return { behavior: 'allow', updatedInput: input }\n  }\n  const deadline = Date.now() + 1800000\n  while (Date.now() < deadline) {\n    if (existsSync(resPath)) {\n      let decision = { behavior: 'deny', message: 'No decision.' }\n      try { decision = JSON.parse(readFileSync(resPath, 'utf8')) } catch (e) {}\n      try { rmSync(reqPath) } catch (e) {}\n      try { rmSync(resPath) } catch (e) {}\n      if (decision.behavior === 'allow') return { behavior: 'allow', updatedInput: input }\n      return { behavior: 'deny', message: decision.message || 'The user declined this action.' }\n    }\n    await sleep(40)\n  }\n  try { rmSync(reqPath) } catch (e) {}\n  return { behavior: 'deny', message: 'Approval timed out.' }\n}\n\nrl.on('line', async (line) => {\n  if (!line.trim()) return\n  let msg\n  try { msg = JSON.parse(line) } catch (e) { return }\n  const id = msg.id\n  const method = msg.method\n  if (method === 'initialize') {\n    send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'approval', version: '1.0.0' } } })\n  } else if (method === 'tools/list') {\n    send({ jsonrpc: '2.0', id, result: { tools: [{ name: 'approval_prompt', description: 'Ask the user to approve a tool action.', inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' } } } }] } })\n  } else if (method === 'tools/call') {\n    const decision = await decide((msg.params && msg.params.arguments) || {})\n    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(decision) }] } })\n  } else if (method === 'notifications/initialized') {\n    return\n  } else if (id !== undefined && id !== null) {\n    send({ jsonrpc: '2.0', id, result: {} })\n  }\n})\n`;
 
 /// Whether node is on PATH. Node runs the MCP permission server. The result is
 /// checked per session start, which is infrequent.
@@ -1257,7 +1263,7 @@ fn watch_approvals(application: ui::app::App, generation: number) {
 					}
 					index = index + 1;
 				}
-				threads::sleep_ms(120);
+				threads::sleep_ms(40);
 			}
 		},
 	);
@@ -1267,14 +1273,31 @@ fn watch_approvals(application: ui::app::App, generation: number) {
 /// control (permission) messages as newline-delimited JSON on stdin and streams
 /// assistant, tool, result, and permission events as JSON on stdout. Centralized
 /// so a different agent CLI, model, or permission mode can be wired here.
-fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: string) => Array<string> {
-	// The "ask" and "acceptEdits" modes both run the CLI in default permission
-	// mode with the MCP approval tool, so every gated action is routed to the
-	// panel. The panel decides which to auto-approve (edits, in acceptEdits) and
-	// which to prompt for. The bypass and plan modes run without the prompt tool.
-	let permission_mode: string = mode;
-	if permission_mode.size() == 0 || permission_mode == "ask" || permission_mode == "acceptEdits" {
-		permission_mode = "default";
+fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: string, model: string) => Array<string> {
+	// Whenever the approval bridge is up, the CLI runs in "manual" — the mode in
+	// which it hands every gated action to the prompt tool rather than deciding
+	// for itself. The panel is then the only policy: it answers each request from
+	// the mode selected at that moment, so switching between Ask, Auto-accept
+	// edits, and Allow all takes effect on the very next action instead of on the
+	// next session. The old mapping asked for "default", under which the CLI
+	// silently ran anything it judged safe and the panel was never consulted,
+	// which is what made "Ask each time" appear to do nothing.
+	//
+	// Without the bridge (no node) the CLI has to enforce the policy alone, so
+	// the panel's mode is translated to the closest mode the CLI has. Plan needs
+	// the CLI's own mode either way: it changes how the agent works, not just who
+	// approves.
+	let permission_mode: string = "manual";
+	if mode == "plan" {
+		permission_mode = "plan";
+	} else if mcp_config.size() == 0 {
+		if mode == "bypassPermissions" {
+			permission_mode = "bypassPermissions";
+		} else if mode == "acceptEdits" {
+			permission_mode = "acceptEdits";
+		} else {
+			permission_mode = "auto";
+		}
 	}
 	let args: Array<string> = new Array<string>();
 	args.push("--print");
@@ -1298,6 +1321,12 @@ fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: stri
 		args.push("--plugin-dir");
 		args.push(plugin_dir);
 	}
+	// A model the user picked in the panel, as an alias (opus, sonnet, haiku) or
+	// a full model name. Empty means the CLI's own default.
+	if model.size() > 0 {
+		args.push("--model");
+		args.push(model);
+	}
 	// Resume a prior session (a thread the panel is continuing).
 	if resume.size() > 0 {
 		args.push("--resume");
@@ -1312,7 +1341,7 @@ fn agent_args(mode: string, resume: string, mcp_config: string, plugin_dir: stri
 /// handed the previous session id, so the prompt is an argument rather than a
 /// line written to stdin. Each maps the panel's permission mode onto whatever
 /// approval control it actually offers, which is coarser than Claude Code's.
-fn agent_turn_args(provider: string, mode: string, resume: string, prompt: string) => Array<string> {
+fn agent_turn_args(provider: string, mode: string, resume: string, prompt: string, model: string) => Array<string> {
 	let args: Array<string> = new Array<string>();
 
 	if provider == "codex" {
@@ -1320,6 +1349,10 @@ fn agent_turn_args(provider: string, mode: string, resume: string, prompt: strin
 		if resume.size() > 0 {
 			args.push("resume");
 			args.push(resume);
+		}
+		if model.size() > 0 {
+			args.push("--model");
+			args.push(model);
 		}
 		args.push("--json");
 		// Codex refuses to run outside a git repository without this, which a
@@ -1342,6 +1375,10 @@ fn agent_turn_args(provider: string, mode: string, resume: string, prompt: strin
 	if provider == "gemini" {
 		args.push("--output-format");
 		args.push("json");
+		if model.size() > 0 {
+			args.push("--model");
+			args.push(model);
+		}
 		if mode == "bypassPermissions" {
 			args.push("--yolo");
 		} else if mode == "acceptEdits" {
@@ -1357,6 +1394,10 @@ fn agent_turn_args(provider: string, mode: string, resume: string, prompt: strin
 		args.push("run");
 		args.push("--format");
 		args.push("json");
+		if model.size() > 0 {
+			args.push("--model");
+			args.push(model);
+		}
 		if resume.size() > 0 {
 			args.push("--session");
 			args.push(resume);
@@ -1372,6 +1413,10 @@ fn agent_turn_args(provider: string, mode: string, resume: string, prompt: strin
 		// Aider emits plain text, not events. --yes keeps it non-interactive.
 		args.push("--no-pretty");
 		args.push("--no-stream");
+		if model.size() > 0 {
+			args.push("--model");
+			args.push(model);
+		}
 		if mode != "plan" {
 			args.push("--yes");
 		}
@@ -1380,6 +1425,10 @@ fn agent_turn_args(provider: string, mode: string, resume: string, prompt: strin
 		return args;
 	}
 
+	if model.size() > 0 {
+		args.push("--model");
+		args.push(model);
+	}
 	args.push(prompt);
 	return args;
 }
@@ -2536,10 +2585,12 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let mode: string = "ask";
 			let resume: string = "";
 			let provider: string = "claude";
+			let model: string = "";
 			if parsed.kind() == "object" {
 				let request: json::JsonObject = parsed as json::JsonObject;
 				mode = field_string(request, "mode");
 				resume = field_string(request, "resume");
+				model = field_string(request, "model");
 				let requested: string = field_string(request, "provider");
 				if requested.size() > 0 {
 					provider = requested;
@@ -2555,9 +2606,10 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			if agent_session_model(provider) != "persistent" {
 				return `{"ok":true,"session":"oneshot"}`;
 			}
-			// Interactive modes route permissions through the approval server when
-			// node is available. Bypass and plan modes run without prompts.
-			let wants_prompts: bool = mode.size() == 0 || mode == "ask" || mode == "acceptEdits";
+			// Every mode that acts routes its actions through the approval server,
+			// so the panel — not the CLI — decides each one and the user can change
+			// their mind mid-session. Plan mode does not act, so it needs no bridge.
+			let wants_prompts: bool = mode != "plan";
 			let mcp_config: string = "";
 			if wants_prompts && node_available() {
 				mcp_config = prepare_approval_files();
@@ -2569,7 +2621,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			}
 			let spawned: process::Process? = spawn_agent_in(
 				agent_command(provider),
-				agent_args(mode, resume, mcp_config, plugin_dir),
+				agent_args(mode, resume, mcp_config, plugin_dir, model),
 				WORKSPACE_ROOT,
 			);
 			if !spawned.is_value() {
@@ -2630,6 +2682,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			}
 			let mode: string = field_string(request, "mode");
 			let resume: string = field_string(request, "resume");
+			let model: string = field_string(request, "model");
 			let provider: string = g_agent.provider;
 			if provider.size() == 0 {
 				provider = "claude";
@@ -2641,7 +2694,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			}
 			let spawned: process::Process? = spawn_agent_in(
 				agent_command(provider),
-				agent_turn_args(provider, mode, resume, text),
+				agent_turn_args(provider, mode, resume, text, model),
 				WORKSPACE_ROOT,
 			);
 			if !spawned.is_value() {
@@ -2653,6 +2706,10 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			}
 			let child: process::Process = spawned.unwrap();
 			g_agent.child = child;
+			// The prompt is an argument, so nothing more is written to this child.
+			// Codex (and aider) also read stdin for extra prompt text and wait for
+			// it to end, so an open pipe would hold the turn before it starts.
+			child.close_input();
 			stream_agent(application, child);
 			return `{"ok":true}`;
 		},
@@ -2690,7 +2747,15 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			if id.size() == 0 || behavior.size() == 0 {
 				return `{"ok":false}`;
 			}
-			let decision: string = `{"behavior":"deny","message":"The user declined this action."}`;
+			// A denial can carry the user's own words, which the CLI hands back to
+			// the model as the tool's result. That is how "Deny with feedback"
+			// redirects the agent instead of just stopping it.
+			let reason: string = field_string(request, "message");
+			if reason.size() == 0 {
+				reason = "The user declined this action.";
+			}
+			let reason_json: string = new json::JsonString(reason).to_string();
+			let decision: string = `{"behavior":"deny","message":${reason_json}}`;
 			if behavior == "allow" {
 				decision = `{"behavior":"allow"}`;
 			}

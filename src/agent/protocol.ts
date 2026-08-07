@@ -42,17 +42,26 @@ export function toolSummary(name: string, input: unknown): string {
     case 'Read':
       return `Read ${rel ?? 'file'}`
     case 'Bash':
-      return `Run: ${String(inp.command ?? '').slice(0, 80)}`
+      return String(inp.command ?? '').slice(0, 120)
     case 'Glob':
       return `Find ${String(inp.pattern ?? '')}`
     case 'Grep':
       return `Search ${String(inp.pattern ?? '')}`
     case 'WebFetch':
       return `Fetch ${String(inp.url ?? '')}`
+    case 'WebSearch':
+      return `Search the web for ${String(inp.query ?? '')}`
     case 'TodoWrite':
       return 'Update task list'
-    default:
-      return name
+    case 'Task':
+      return String(inp.description ?? 'Run a subagent')
+    case 'Skill':
+      return `Skill ${String(inp.skill ?? '')}`
+    default: {
+      // An MCP tool is named mcp__<server>__<tool>; the bare tool reads better.
+      const mcp = /^mcp__[^_]+__(.+)$/.exec(name)
+      return mcp ? mcp[1].replace(/_/g, ' ') : name
+    }
   }
 }
 
@@ -119,7 +128,11 @@ export function normalize(raw: unknown): AgentItem[] {
     return []
   }
 
+  // Only the init event describes the session. The CLI also emits system events
+  // for transient status ("requesting"), which carry no model and would blank
+  // the header if they were treated as a fresh session announcement.
   if (type === 'system') {
+    if (String(e.subtype ?? 'init') !== 'init') return []
     return [
       {
         kind: 'system',
@@ -210,14 +223,27 @@ export function userMessageLine(text: string): string {
 }
 
 // A permission decision line for the agent's stdin, answering a can_use_tool
-// control request.
-export function permissionResponseLine(requestId: string, allow: boolean): string {
+// control request. A denial carries the user's reason, which the agent reads as
+// the tool's result.
+export function permissionResponseLine(requestId: string, allow: boolean, message = ''): string {
   return JSON.stringify({
     type: 'control_response',
     response: {
       subtype: 'success',
       request_id: requestId,
-      response: { behavior: allow ? 'allow' : 'deny' },
+      response: allow
+        ? { behavior: 'allow' }
+        : { behavior: 'deny', message: message || 'The user declined this action.' },
     },
+  })
+}
+
+// An interrupt for the turn in flight. Unlike killing the process this keeps the
+// session — and its context — alive, so the next message continues the thread.
+export function interruptLine(): string {
+  return JSON.stringify({
+    type: 'control_request',
+    request_id: `int-${Date.now().toString(36)}`,
+    request: { subtype: 'interrupt' },
   })
 }

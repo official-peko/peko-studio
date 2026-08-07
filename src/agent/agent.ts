@@ -33,13 +33,14 @@ export async function agentStatus(): Promise<AgentStatus> {
   }
 }
 
-/// Start (or restart) the agent session in the workspace with a permission mode
-/// and provider. A non-empty `resume` continues a prior session by id. For a
-/// one-shot provider this only records the choice; the first message starts the
-/// first turn. Events arrive on the ide.agent:event channel.
-export async function agentStart(mode = 'default', resume = '', provider = 'claude'): Promise<boolean> {
+/// Start (or restart) the agent session in the workspace with a permission mode,
+/// provider, and model. A non-empty `resume` continues a prior session by id; an
+/// empty `model` leaves the choice to the CLI's own configuration. For a one-shot
+/// provider this only records the choice; the first message starts the first
+/// turn. Events arrive on the ide.agent:event channel.
+export async function agentStart(mode = 'ask', resume = '', provider = 'claude', model = ''): Promise<boolean> {
   try {
-    const result = (await peko.invoke('ide.agent.start', { mode, resume, provider })) as { ok?: boolean }
+    const result = (await peko.invoke('ide.agent.start', { mode, resume, provider, model })) as { ok?: boolean }
     return result.ok === true
   } catch {
     return false
@@ -48,9 +49,9 @@ export async function agentStart(mode = 'default', resume = '', provider = 'clau
 
 /// Run one turn of a one-shot provider with `text` as the prompt. `resume` is
 /// the session id seen in the previous turn, which is what continues the thread.
-export async function agentSend(text: string, mode: string, resume = ''): Promise<boolean> {
+export async function agentSend(text: string, mode: string, resume = '', model = ''): Promise<boolean> {
   try {
-    const result = (await peko.invoke('ide.agent.send', { text, mode, resume })) as { ok?: boolean }
+    const result = (await peko.invoke('ide.agent.send', { text, mode, resume, model })) as { ok?: boolean }
     return result.ok === true
   } catch {
     return false
@@ -67,9 +68,11 @@ export async function agentInput(line: string): Promise<void> {
 }
 
 /// Record an allow/deny decision for a pending action from the approval bridge.
-export async function agentApprove(id: string, allow: boolean): Promise<void> {
+/// A denial can carry the user's reason, which the agent reads as the result of
+/// the action it asked for.
+export async function agentApprove(id: string, allow: boolean, message = ''): Promise<void> {
   try {
-    await peko.invoke('ide.agent.approve', { id, behavior: allow ? 'allow' : 'deny' })
+    await peko.invoke('ide.agent.approve', { id, behavior: allow ? 'allow' : 'deny', message })
   } catch {
     // No bridge; nothing to record.
   }

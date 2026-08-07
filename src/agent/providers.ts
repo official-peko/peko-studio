@@ -24,6 +24,15 @@ import { type AgentItem, normalize as normalizeClaude, toolSummary } from './pro
 
 export type ProviderId = 'claude' | 'codex' | 'gemini' | 'opencode' | 'aider'
 
+/// A model the panel can ask a provider for. An empty value means "whatever the
+/// CLI is configured to use", which is always the first choice: the CLI's own
+/// default follows the user's login and config, and naming models here would go
+/// stale as providers ship new ones.
+export interface ModelChoice {
+  value: string
+  label: string
+}
+
 export interface Provider {
   id: ProviderId
   label: string
@@ -35,9 +44,14 @@ export interface Provider {
   inlineApproval: boolean
   /// Permission modes this CLI can actually honor.
   modes: string[]
+  /// Models offered in the header, passed to the CLI's model flag. Empty when
+  /// the CLI takes whatever its own configuration says.
+  models: ModelChoice[]
   /// Shown when the CLI is not installed.
   install: string
 }
+
+const DEFAULT_MODEL: ModelChoice = { value: '', label: 'Default model' }
 
 export const PROVIDERS: Provider[] = [
   {
@@ -47,6 +61,14 @@ export const PROVIDERS: Provider[] = [
     streams: true,
     inlineApproval: true,
     modes: ['ask', 'acceptEdits', 'bypassPermissions', 'plan'],
+    // Aliases rather than dated model names, so these keep pointing at the
+    // current release of each tier.
+    models: [
+      DEFAULT_MODEL,
+      { value: 'opus', label: 'Opus' },
+      { value: 'sonnet', label: 'Sonnet' },
+      { value: 'haiku', label: 'Haiku' },
+    ],
     install: 'npm i -g @anthropic-ai/claude-code',
   },
   {
@@ -56,6 +78,7 @@ export const PROVIDERS: Provider[] = [
     streams: false,
     inlineApproval: false,
     modes: ['acceptEdits', 'bypassPermissions', 'plan'],
+    models: [DEFAULT_MODEL],
     install: 'npm i -g @openai/codex',
   },
   {
@@ -65,6 +88,7 @@ export const PROVIDERS: Provider[] = [
     streams: false,
     inlineApproval: false,
     modes: ['acceptEdits', 'bypassPermissions'],
+    models: [DEFAULT_MODEL],
     install: 'npm i -g @google/gemini-cli',
   },
   {
@@ -74,6 +98,7 @@ export const PROVIDERS: Provider[] = [
     streams: false,
     inlineApproval: false,
     modes: ['acceptEdits', 'bypassPermissions'],
+    models: [DEFAULT_MODEL],
     install: 'curl -fsSL https://opencode.ai/install | bash',
   },
   {
@@ -83,6 +108,7 @@ export const PROVIDERS: Provider[] = [
     streams: false,
     inlineApproval: false,
     modes: ['acceptEdits', 'plan'],
+    models: [DEFAULT_MODEL],
     install: 'python -m pip install aider-install && aider-install',
   },
 ]
