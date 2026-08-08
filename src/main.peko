@@ -233,7 +233,7 @@ fn node_version_score(bin: string) => number {
 		out = `${out}${line.unwrap()}`;
 		line = child.read_line();
 	}
-	child.wait();
+	finish_child(child);
 	if out.size() < 2 {
 		return -1;
 	}
@@ -347,7 +347,7 @@ fn resolve_path() => string {
 			}
 			line = child.read_line();
 		}
-		child.wait();
+		finish_child(child);
 	}
 	if discovered.size() == 0 {
 		discovered = env::get("PATH");
@@ -437,7 +437,7 @@ fn run_peko_capture(args: Array<string>) => string {
 		}
 		line = child.read_line();
 	}
-	child.wait();
+	finish_child(child);
 	return out;
 }
 
@@ -462,7 +462,7 @@ fn run_peko_result(args: Array<string>) => string {
 		out = `${out}${errline.unwrap()}\n`;
 		errline = child.read_error_line();
 	}
-	let code: number = child.wait();
+	let code: number = finish_child(child);
 	let ok: string = "false";
 	if code == 0 {
 		ok = "true";
@@ -489,7 +489,7 @@ fn command_capture(bin: string, args: Array<string>) => string {
 		out = `${out}${line.unwrap()}`;
 		line = child.read_line();
 	}
-	child.wait();
+	finish_child(child);
 	return out;
 }
 
@@ -513,7 +513,7 @@ fn command_code(bin: string, args: Array<string>) => number {
 	while errline.is_value() {
 		errline = child.read_error_line();
 	}
-	return child.wait();
+	return finish_child(child);
 }
 
 /// The GitHub release target triple for this host, empty when unsupported.
@@ -793,10 +793,77 @@ fn start_file_watcher(application: ui::app::App) {
 	);
 }
 
+/// Wait for `child` to exit, release its pipes, and return its exit code.
+///
+/// A Process holds three OS pipe descriptors, and only free() closes them —
+/// wait() reaps the child but leaves the pipes open. A windowed process on macOS
+/// is allowed 256 descriptors, so a session that keeps spawning without
+/// releasing eventually cannot spawn at all: every later launch fails, and the
+/// IDE reports that it cannot run peko while the same command still works in a
+/// terminal. Restarting is the only cure because the descriptors go with the
+/// process. Every spawn that runs to completion on one thread ends here.
+fn finish_child(child: process::Process) => number {
+	let code: number = child.wait();
+	child.free();
+	return code;
+}
+
+/// Drain a child's stdout and stderr through the two callbacks until both ends,
+/// then wait for it and release its pipes, returning the exit code.
+///
+/// stderr is drained on its own thread: a child that fills the stderr pipe while
+/// this thread is reading stdout would block, and neither side would move again.
+/// free() must not run while that thread is still reading, so the drain raises a
+/// flag on its way out and this waits for it.
+///
+/// This is for a child nothing else holds. The dev loop and the agent session
+/// keep theirs in a global where another handler can kill them, so no single
+/// point knows when the last reference is gone; those are left to the process.
+fn pump_child(
+	child: process::Process,
+	on_out: closure(string) => void,
+	on_err: closure(string) => void,
+) => number {
+	let drained: threads::Mutex<Flag> = new threads::Mutex<Flag>(new Flag());
+	threads::new_thread(
+		closure[child, on_err, drained]() => void {
+			let errline: string? = child.read_error_line();
+			while errline.is_value() {
+				on_err(errline.unwrap());
+				errline = child.read_error_line();
+			}
+			let done: Flag = drained.lock();
+			done.value = true;
+			drained.release();
+		},
+	);
+	let line: string? = child.read_line();
+	while line.is_value() {
+		on_out(line.unwrap());
+		line = child.read_line();
+	}
+	let code: number = child.wait();
+	// Both streams have ended by now, but the stderr thread can still be between
+	// its last read and its flag, and freeing would pull the handle out from
+	// under it.
+	let waiting: bool = true;
+	while waiting {
+		let done: Flag = drained.lock();
+		waiting = !done.value;
+		drained.release();
+		if waiting {
+			threads::sleep_ms(5);
+		}
+	}
+	child.free();
+	drained.free();
+	return code;
+}
+
 /// Stream a child's stdout and stderr to the webview as `event_name` output
-/// events, then emit a final idle status with the exit code. Runs the wait on a
-/// new thread so the bridge call that started the child returns immediately and
-/// does not block dispatch for the life of a build.
+/// events, then emit a final idle status with the exit code. Runs on a new
+/// thread so the bridge call that started the child returns immediately and does
+/// not block dispatch for the life of a build.
 fn stream_process(
 	application: ui::app::App,
 	child: process::Process,
@@ -805,19 +872,17 @@ fn stream_process(
 ) {
 	threads::new_thread(
 		closure[application, child, event_name, label]() => void {
-			child.on_output(
+			let code: number = pump_child(
+				child,
 				closure[application, event_name](line: string) => void {
 					let text_json: string = new json::JsonString(line).to_string();
 					application.emit(event_name, `{"t":"output","stream":"stdout","text":${text_json}}`);
 				},
-			);
-			child.on_error(
 				closure[application, event_name](line: string) => void {
 					let text_json: string = new json::JsonString(line).to_string();
 					application.emit(event_name, `{"t":"output","stream":"stderr","text":${text_json}}`);
 				},
 			);
-			let code: number = child.wait();
 			let summary: string = new json::JsonString(`${label} exited with code ${code}`).to_string();
 			application.emit(event_name, `{"t":"output","stream":"stdout","text":${summary}}`);
 			application.emit(event_name, `{"t":"status","state":"idle"}`);
@@ -862,6 +927,25 @@ fn stream_run(application: ui::app::App, child: process::Process) {
 	);
 }
 
+/// Forward one `peko setup --json` stdout line to the setup screen. A setup
+/// event is a JSON object, forwarded as-is; any other line is human log output,
+/// wrapped as an info event; an empty line has nothing to report.
+///
+/// This is a named function rather than the body of the drain closure because a
+/// closure literal that contains a bare `if` is rejected when it is passed to a
+/// call whose result is used, as pump_child's is.
+fn emit_setup_line(application: ui::app::App, line: string) {
+	if line.size() == 0 {
+		return;
+	}
+	if line.starts_with("{") {
+		application.emit("ide.setup:event", line);
+		return;
+	}
+	let text_json: string = new json::JsonString(line).to_string();
+	application.emit("ide.setup:event", `{"type":"info","message":${text_json}}`);
+}
+
 /// Stream a `peko setup --json` child to the first-run setup screen. Each stdout
 /// line is one newline-delimited JSON progress event, forwarded unchanged as an
 /// ide.setup:event. Human stderr lines are wrapped as stderr events. On exit the
@@ -896,28 +980,16 @@ fn run_setup_flow(application: ui::app::App, args: Array<string>, dir: string) {
 				return;
 			}
 			let child: process::Process = spawned.unwrap();
-			child.on_output(
+			let code: number = pump_child(
+				child,
 				closure[application](line: string) => void {
-					if line.size() == 0 {
-						return;
-					}
-					// A setup event is a JSON object, forwarded as-is. Any other
-					// stdout line is human log output, wrapped as an info event.
-					if line.starts_with("{") {
-						application.emit("ide.setup:event", line);
-					} else {
-						let text_json: string = new json::JsonString(line).to_string();
-						application.emit("ide.setup:event", `{"type":"info","message":${text_json}}`);
-					}
+					emit_setup_line(application, line);
 				},
-			);
-			child.on_error(
 				closure[application](line: string) => void {
 					let text_json: string = new json::JsonString(line).to_string();
 					application.emit("ide.setup:event", `{"type":"stderr","message":${text_json}}`);
 				},
 			);
-			let code: number = child.wait();
 			application.emit("ide.setup:done", `{"code":${code}}`);
 		},
 	);
@@ -1150,7 +1222,7 @@ fn refresh_account_identity() => string {
 			}
 		}
 	}
-	child.wait();
+	finish_child(child);
 	if clean.size() > 0 {
 		identity = clean;
 	} else if uid.size() > 0 || name.size() > 0 || email.size() > 0 {
@@ -1194,7 +1266,7 @@ fn node_available() => bool {
 	}
 	let child: process::Process = spawned.unwrap();
 	let line: string? = child.read_line();
-	child.wait();
+	finish_child(child);
 	return line.is_value();
 }
 
@@ -1889,7 +1961,7 @@ fn create_project(dir: string, name: string, project_type: string, framework: st
 		return "";
 	}
 	let child: process::Process = spawned.unwrap();
-	let code: number = child.wait();
+	let code: number = finish_child(child);
 	if code != 0 {
 		return "";
 	}
@@ -2183,7 +2255,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 					args.push("login");
 					let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
 					if spawned.is_value() {
-						spawned.unwrap().wait();
+						finish_child(spawned.unwrap());
 					}
 					let identity: string = refresh_account_identity();
 					application.emit("ide.account:changed", identity);
@@ -2202,7 +2274,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			args.push("logout");
 			let spawned: process::Process? = spawn_peko_in(args, WORKSPACE_ROOT);
 			if spawned.is_value() {
-				spawned.unwrap().wait();
+				finish_child(spawned.unwrap());
 			}
 			fs::remove(account_cache_file());
 			application.emit("ide.account:changed", `{"authenticated":false}`);
@@ -2452,7 +2524,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				if branch_line.is_value() {
 					branch = branch_line.unwrap();
 				}
-				branch_child.wait();
+				finish_child(branch_child);
 			}
 
 			let status_args: Array<string> = new Array<string>();
@@ -2477,7 +2549,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				}
 				line = child.read_line();
 			}
-			child.wait();
+			finish_child(child);
 
 			let branch_json: string = new json::JsonString(branch).to_string();
 			return `{"branch":${branch_json},"entries":[${joined}]}`;
@@ -2547,7 +2619,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 				if spawned.is_value() {
 					let child: process::Process = spawned.unwrap();
 					let line: string? = child.read_line();
-					child.wait();
+					finish_child(child);
 					if line.is_value() {
 						available = true;
 						version = line.unwrap();
@@ -3535,7 +3607,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let child: process::Process = spawned.unwrap();
 			child.write_line(data);
 			child.close_input();
-			let code: number = child.wait();
+			let code: number = finish_child(child);
 			if code == 0 {
 				g_signing.valid = false;
 				return `{"ok":true}`;
@@ -3573,7 +3645,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			let child: process::Process = spawned.unwrap();
 			child.write_line(password);
 			child.close_input();
-			let code: number = child.wait();
+			let code: number = finish_child(child);
 			if code == 0 {
 				g_signing.valid = false;
 				return `{"ok":true}`;
@@ -3679,7 +3751,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			while errline.is_value() {
 				errline = child.read_error_line();
 			}
-			let code: number = child.wait();
+			let code: number = finish_child(child);
 			let healthy: string = "false";
 			if code == 0 {
 				healthy = "true";
@@ -3763,7 +3835,7 @@ fn register_ide_handlers(application: ui::app::App, lsp_port: number) {
 			while errline.is_value() {
 				errline = child.read_error_line();
 			}
-			child.wait();
+			finish_child(child);
 			if result.size() > 0 {
 				return result;
 			}
