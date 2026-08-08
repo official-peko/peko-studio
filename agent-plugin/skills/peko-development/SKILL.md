@@ -55,6 +55,10 @@ Use the cheapest check that covers the change, then escalate.
 A green `peko test` is not sufficient on its own. After editing, test the changed
 files, then build. Fix diagnostics before moving on.
 
+**When a build fails, run `peko clean` and build again before you start reading
+the error.** The incremental cache goes stale often enough, and fails loudly
+enough, that ruling it out first is cheaper than being misled by it — see below.
+
 ## Running a UI app
 
 `peko run` on a UI project is an incremental dev loop, not a one-shot build:
@@ -116,12 +120,34 @@ read them before editing a managed-memory boundary.
 
 ## When something looks stale or wrong
 
+**The command is `peko clean`, run on its own before `peko build`.** There is no
+`--clean` flag on `peko build`, and unknown flags are ignored rather than
+rejected, so `peko build --clean` exits 0 having cleaned nothing. It looks like a
+clean build and is not one — if you reached for it, the cache is still stale and
+the error you are looking at is still the cache's.
+
+A stale incremental cache is the single most common cause of a build error that
+does not match the code, and it does not announce itself — it fails as though
+your change were at fault:
+
+- A compiler panic (`called Option::unwrap() on a None value`) inside codegen or
+  an unrelated standard-library function.
+- An error pointing at a file you did not touch, or at a function that type-checks
+  cleanly with `peko test`.
+- A build that fails right after an edit that `peko test` accepts, and keeps
+  failing however you rewrite the edit.
+
+Run `peko clean` and build again before you spend any time bisecting. Its cost is
+one full rebuild; the cost of trusting a stale cache is chasing a bug that is not
+in the code. The cache keys on absolute paths, so a project that moved or was
+renamed on disk carries dead entries until it is cleaned.
+
+Other stale state:
+
 - Build output not reflecting a CLI or toolkit change: reinstall peko or mirror
-  the toolkit, then `peko build --clean`. Bundling config files under
+  the toolkit, then `peko clean`. Bundling config files under
   `.peko/bundling/configfiles/` are generated once and not regenerated unless you
-  pass `--regenconfig`.
-- A compiler panic on an unrelated standard-library function usually means a
-  stale incremental cache. `peko build --clean` clears it.
+  pass `peko build --regenconfig`.
 - `peko check` verifies the toolchain install; `peko check --rehash` re-certifies
   it after you change files under the Peko root.
 

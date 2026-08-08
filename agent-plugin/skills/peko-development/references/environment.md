@@ -87,15 +87,22 @@ looks corrupted. After hand-editing anything under `~/.Peko`, re-certify with
 
 ## Stale-state checklist
 
-Build output that does not reflect a change is almost always one of these:
+Clear the cache first: when a build fails or its output does not reflect a
+change, run `peko clean` and build again before investigating. The command is
+`peko clean` on its own — `peko build` has no `--clean` flag and ignores unknown
+flags, so `peko build --clean` exits 0 after a normal incremental build, having
+cleaned nothing.
 
+Then work through the rest:
+
+- A stale incremental cache. The usual cause, and the hardest to recognize: it
+  presents as a compiler panic inside codegen or an unrelated standard-library
+  function, or as an error against a file you did not touch, rather than as a
+  clear message. `peko clean` clears it.
+- A project moved or was renamed on disk. The incremental cache keys on absolute
+  paths, so entries from the old path linger until cleaned.
 - The CLI or the toolkit changed but was not reinstalled. Reinstall, then
-  `peko build --clean`.
+  `peko clean`.
 - Bundling configuration under `.peko/bundling/configfiles/` is generated on first
   build and never refreshed. `peko build --regenconfig` rewrites the templates,
   discarding local edits to them.
-- A stale incremental cache. This can present as a compiler panic inside an
-  unrelated standard-library function rather than as a clear error.
-  `peko build --clean` clears it.
-- A project moved or was renamed on disk. The incremental cache keys on absolute
-  paths, so entries from the old path linger until cleaned.

@@ -66,9 +66,17 @@ survive exactly. Formats in place by default.
   would change. `--stdout` prints instead of writing.
 
 ### `peko clean`
-Removes the project's build cache and output. The fix for a stale incremental
-cache, which can present as a compiler panic on an unrelated standard-library
-function.
+Removes the project's build cache and output. The first thing to run when a build
+fails: a stale incremental cache presents as a compiler panic in codegen or an
+unrelated standard-library function, or as an error against code you did not
+touch, so ruling it out costs one rebuild and saves a false trail.
+
+It is its own command. `peko build --clean` is not a thing: `build` takes
+`--release`, `--platform`, `--regenconfig`, `--demo`, `--prebuild`, `--target`,
+and `--web-dist`, and it ignores a flag it does not know instead of rejecting it.
+So `peko build --clean` exits 0 after an ordinary incremental build, having
+cleaned nothing — it reads as a successful clean build and is not one. Run
+`peko clean`, then `peko build`.
 
 ### `peko search`
 Text search and replace across the project. Exists for the IDE; prefer normal
